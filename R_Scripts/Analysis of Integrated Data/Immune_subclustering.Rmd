@@ -1,0 +1,681 @@
+---
+title: "immune_subclustering"
+output: html_document
+date: "2024-04-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(fields)
+library(KernSmooth)
+library(DoubletFinder)
+library(scCustomize)
+library(openxlsx)
+library(gplots)
+library(ggplot2)
+library(ggrastr)
+library(RColorBrewer)
+library(DropletUtils)
+library(SingleR)
+library(ROCR)
+library(parallel)
+library(celldex)
+library(SingleCellExperiment)
+library(pheatmap)
+library(Matrix)
+library(stringi)
+library(Seurat)
+
+generateCellTypeLists <- function(signature_file_path, celltype, seurat_object) {
+# Load the Excel file with specific cell types and associated genes
+cell_signatures_xl <- read.xlsx(signature_file_path, detectDates = FALSE)
+
+# Initialize an empty list to store gene sets for specific cell types
+signature_list <- list()
+
+# Iterate through the columns (specific cell types) in the Excel file
+for (i in 1:ncol(cell_signatures_xl)) {
+  cell_type <- colnames(cell_signatures_xl)[i]
+  genes <- cell_signatures_xl[, i]
+  
+  # Filter out empty gene names (if any)
+  genes <- genes[!is.na(genes) & genes != ""]
+  
+  # Store the genes associated with the specific cell type in the list
+  signature_list[[cell_type]] <- genes
+}
+
+
+return(
+signature_list[[celltype]])
+}
+
+cardiomyocyte_types <- c("Ventricular.Cardiomyocyte", "Atrial.Cardiomyocyte", "Cardiac.progenitor.cells")
+
+endothelial_types <- c("Other.Endothelial",	"Venous.ECs",	"Lymphatic.ECs", "Arterial.ECs", "Cycling.ECs")
+
+b_cell_types <- c("Plasma.cells", "Activated.B.cells", "Cycling.B.cells", "Stromal.cells", "Follicular.B.cells", "Germinal.center.B.cells", "Memory.B.cells", "Naive.B.cells", "Transitional.B.cells", "Large.pre-B.cells", "Pre-pro-B.cells", "Pro-B.cells")
+  
+
+fibroblast_types <- c("Perivascular.Fibroblasts", "CAFs", "Mesangial.Fibroblasts", "Ependymal.Cells", "myCAF", "dCAF", "iCAF", "pCAF", "Intermediate.pathological.FB", "Adventitial.FB", "Alveolar.FB", "Pathological.FB", "Alveolar.FB", "Other.FB", "Airway.smooth.muscle", "Pericyte", "Vascular.smooth.muscle", "Mesothelial.FB")
+  
+
+myeloid_types <- c("cDC1", "DC2", "Cycling.Myleoid", "DC3", "Developing.granulocytes.neutrophils", "Macrophage.1", "Macrophage.2", "Mast.cells", "Microglia", "Monocytes.MDM", "Langerhans-like.cells", "Myeloid-derived.suppressor.cells", "Dendritic.cells", "Migratory.DC", "Transitional.DC", "DC.precursor", "Granulocytes", "Neutrophils", "Neutrophil-myeloid.progenitor", "Intermediate.macrophages")
+  
+#c("MacrophagesM1", 'MacrophagesM2',
+#  "M1_Macrophage_Polarization",	"M2_Macrophage_Polarization", "Mono_CD16", "Mono_CD16_C1qa",  "Mono_Apobec3b",
+#  "Mono_Apobec3a",	"Mono_CD14_Antiviral",	"Mono_CD14",	'Mono_CD14_Inflam',	"MonoT_Doublet",	"Monocyte",	"Inflammatory_monocytes",	"resident_monocytes")
+
+Tcell_types <- c("Activated/differentiating", "CD8.Activated/Differentiating", "CD8.Activated/EM", "CD8.Naive/Stemlike", "CD8.Terminally.differentiated.high", "CD8.Terminally.differentiated.intermediate", "Naive-Stem-like", "T.helper.cells", "TRM", "Tregs", "Gamma.delta.T.cells", "NKT", "CD8.alpha/alpha.T.cells", "CD8.alpha/beta.(entry).T.cells", "Mucosal-associated.invariant.T.cells", "Memory.CD4+.cytotoxic.T.cells", "CD4.helper.T.lymphocytes", "Terminally.differentiated.CD8+.cytotoxic.T.lymphocytes", "Type.17.helper.T.cells", "Cycling.NK.cells")
+  
+#c("Tfh",	"CD8_NaiveLike",	"CD8_EffectorMemory",	"CD8_EarlyActiv",	"Th1",	"CD4_NaiveLike",	"CD8_Tpex",	"CD8_Tex",	"Treg")
+
+
+integrated <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/integration_with_celltypes.rds")
+group_mapping <- c("191" = "KL-MSA1",
+                   "20" = "KL-MSA2",
+                   "22" = "KL-DMSO",
+                   "23" = "KL-CGASKO-DMSO",
+                   "24" = "KL-DMSO",
+                   "25" = "KL-CGASKO-MSA1",
+                   "26" = "KL-CGASKO-MSA2",
+                   "27" = "KL-CGASKO-DMSO",
+                   "28" = "KL-CGASKO-DMSO",
+                   "29" = "KL-DMSO",
+                   "30" = "KL-CGASKO-MSA3",
+                   "31" = "KL-MSA2",
+                   "32" = "KL-MSA3",
+                   "33" = "KL-MSA5")
+
+# Add group information to ID_major column
+integrated@meta.data$ID_major <- group_mapping[integrated@meta.data$orig.ident] 
+  
+immuneseu <- subset(integrated, subset = celltypes!='Malignant')
+
+samples <- c("B Cell", "Endothelial", "Fibroblast", "Myeloid", 
+             "T Cell", "Pericytes", "Other")
+
+immune = toupper(c("Cd4", "Cd8", "Tox", "Gzmb", "Lag3", "Cd274", "Pdcd1", "Stat1", "Gbp1", "Gbp5", "Mx1", "Mx2", "Ifi44", "Siglec1", "Rnase1", "Cd163", "Mertk", "Marco", "Cyp27a1", "Pparg", "Ano5", "Lta4h", "Fbp1", "Denndc", "Itgax", "Camk1d", "Abcc5", "Csf2ra", "Nampt", "Cd63", "Stat4", "Runx2", "Itga4", "Ikzf1", "Tnfaip3", "Cd69", "Jak1", "Itga", "Cd44", "Mgat5", "Prkca", "Bach2", "Nck2", "Celf2", "Camk4", "Tnik", "Dthd1", "Ptprc", "Pyhin1", "Ccl5", "Lyst", "Themis", "Cblb", "Iqgap2", "Itk", "Ets1", "Skap1", "Elmo1", "Itga4", "Cd96", "Cd44", "Ifi6", "NFAT5", "Cd66b", "Cd33", "Mpo", "Cd15"))
+  
+tumour = toupper(c("Sftpa1", "Sftpb", "Sftpc", "Shh", "Ptch", "Fgf8", "Fgf10", "Hnf4", "Cdh2", "Vegfr", "Vegf", "Pdgfr", "Pdgfr", "Fgf", "Fgfr", "Ra", "Rar", "Ccsp", "Sox2", "Sox9", "Epcam", "Stk11"))
+
+seurat_list <- list()
+seu_sce <- list()
+
+### subset 
+minFeature<-200
+maxFeature<- 12000
+minCount<- 800
+maxCount<- 70000
+maxMT<-15
+
+# Loop through each sample to create Seurat objects
+for(sample in samples){
+  seurat_obj <- subset(immuneseu, subset = celltypes == sample[1])
+  seurat_list[[sample]] <- CreateSeuratObject(counts = seurat_obj@assays$RNA$counts, 
+                              min.cells = 3, min.features = 300)
+  seurat_list[[sample]]$percent.mt <- PercentageFeatureSet(object = seurat_list[[sample]], pattern = "^MT-")
+  seurat_list[[sample]]$barcode_orig <- rownames(seurat_list[[sample]]@meta.data)
+  seurat_list[[sample]] <- subset(seurat_list[[sample]], subset = nFeature_RNA > minFeature & nFeature_RNA < maxFeature & 
+                nCount_RNA > minCount & nCount_RNA < maxCount & 
+                percent.mt < maxMT)
+  seurat_list[[sample]] <- NormalizeData(seurat_list[[sample]])
+  seurat_list[[sample]] <- FindVariableFeatures(seurat_list[[sample]])
+  seurat_list[[sample]] <- ScaleData(seurat_list[[sample]])
+  seurat_list[[sample]] <- RunPCA(seurat_list[[sample]])
+  
+  seurat_list[[sample]] <- RunUMAP(seurat_list[[sample]], dims = 1:30)
+  seurat_list[[sample]] <- FindNeighbors(seurat_list[[sample]], dims = 1:30)
+  seurat_list[[sample]] <- FindClusters(seurat_list[[sample]], resolution = 0.5)
+  
+  seu_sce[[sample]] <- as.SingleCellExperiment(seurat_list[[sample]])
+  
+  mouse_ref<-MouseRNAseqData()
+  pred_main <- SingleR(test = seu_sce[[sample]], ref = mouse_ref, labels = mouse_ref$label.main)
+  pruneScores(pred_main)
+  seurat_list[[sample]][['celltype_main']]<-pred_main$pruned.labels
+  
+  pred_fine <- SingleR(test = seu_sce[[sample]], ref = mouse_ref, labels = mouse_ref$label.fine)
+  pruneScores(pred_fine)
+  seurat_list[[sample]][['celltype_fine']]<-pred_fine$pruned.labels
+  
+  
+  if (sample == "Other"){
+    valid_immune <- immune[immune %in% rownames(seurat_list[[sample]]@assays$RNA$counts)]
+    valid_tumour <- tumour[tumour %in% rownames(seurat_list[[sample]]@assays$RNA$counts)]
+    seurat_list[[sample]] <- AddModuleScore(object = seurat_list[[sample]], features = valid_immune, name = "immune_Score")
+    seurat_list[[sample]] <- AddModuleScore(object = seurat_list[[sample]], features = valid_tumour, name = "tumour_Score")
+  }  
+  
+  
+  else if (sample == "B Cell"){
+    for (type in b_cell_types){
+      gene_list <- generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Downloads/bcells.signature.xlsx', celltype=type, seurat_object = seurat_list[[sample]])
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+        seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+      }
+  }  
+  
+  else if (sample == "Endothelial"){
+    for (type in cardiomyocyte_types){
+      gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/cardiomyocytes.signature.mouse.xlsx', celltype=type, seurat_object = seurat_list[[sample]]))
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+        seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    }
+  for (type in endothelial_types){
+    gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/endothelial.signature.mouse.xlsx', celltype=type, seurat_object = seurat_list[[sample]]))
+    if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+      seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+    }
+  }
+  }
+  
+  else if (sample == "Fibroblast" | sample =="Pericytes"){
+    for (type in fibroblast_types){
+      gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Downloads/fibroblasts.signature.xlsx', celltype=type, seurat_object = seurat_list[[sample]]))
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+        seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    }
+  }
+  
+  else if (sample == "Myeloid"){
+    for (type in myeloid_types){
+      gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Downloads/myeloid.signature.xlsx', celltype=type, seurat_object = seurat_list[[sample]]))
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+        seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    } 
+  }
+  
+  else if (sample == "T Cell"){
+    for (type in Tcell_types){
+      gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Downloads/tcell.signature.xlsx', celltype=type, seurat_object = seurat_list[[sample]]))
+      if (length(gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)])>0){
+        seurat_list[[sample]] <-  AddModuleScore(object = seurat_list[[sample]], features = gene_list[gene_list %in% rownames(seurat_list[[sample]]@assays$RNA$counts)], name = paste0(type, "_Score"))
+      }
+    }  
+  }
+  
+
+    # Define the columns to keep
+  columns_to_keep <- c("orig.ident", "nCount_RNA", "nFeature_RNA", 
+                     "percent.mt", "barcode_orig", "RNA_snn_res.0.5",
+                     "seurat_clusters", "celltype_main", "celltype_fine",
+                     grep("_Score1$", colnames(seurat_list[[sample]]@meta.data), value = TRUE))
+
+  # Subset the metadata to keep only the specified columns
+  seurat_list[[sample]]@meta.data <- seurat_list[[sample]]@meta.data[, columns_to_keep]
+
+}
+
+pdf(file = "/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/immune_subclustering_unsupervised_annotation.pdf")
+for (sample in samples){
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom")+ggtitle(paste0(sample))
+)
+#  for (score in c(colnames(seurat_list[[sample]]@meta.data)[10:length(colnames(seurat_list[[sample]]@meta.data))])){
+#  print(FeaturePlot(object = seurat_list[[sample]], features = score)+ggtitle(paste0(score, " for ", sample)))
+#    }
+}
+dev.off()
+
+#### use only relevant signatures, rename cycling B to cycling
+
+pdf(file = "/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/immune_subclustering_signature_scores.pdf")
+for (sample in samples){
+  for (score in c(colnames(seurat_list[[sample]]@meta.data)[10:length(colnames(seurat_list[[sample]]@meta.data))])){
+  print(FeaturePlot(object = seurat_list[[sample]], features = score)+ scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu"))) +ggtitle(paste0(score, " for ", sample)))
+    }
+}
+dev.off()
+
+create_boxplots_separate_pages <- function(seurat_list, sample, celltype_scores) {
+  for (score in celltype_scores) {
+    # Extract cell type scores
+    celltype_data <- seurat_list[[sample]]@meta.data[, c(score, "seurat_clusters")]
+    
+    # Reshape data for ggplot
+    celltype_data_long <- reshape2::melt(celltype_data, id.vars = "seurat_clusters")
+    
+    # Calculate medians by cluster
+    median_data <- aggregate(value ~ seurat_clusters, data = celltype_data_long, FUN = median)
+    median_data <- median_data[order(median_data$value, decreasing = TRUE), ]  # Order by median
+    
+    # Reorder factor levels based on median values
+    celltype_data_long$seurat_clusters <- factor(celltype_data_long$seurat_clusters, levels = median_data$seurat_clusters)
+   
+    # Create box plot
+    p <- ggplot(celltype_data_long, aes(x = factor(seurat_clusters), y = value)) +
+      geom_boxplot() +
+      labs(x = "Cluster", y = "Celltype Score", title = score) +
+      theme_minimal()
+    
+    # Save plot to separate file
+
+    print(p)
+
+  }
+}
+
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/immune_subclustering_boxplots.pdf")
+for (sample in samples){
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom")+ggtitle(paste0(sample))
+)
+  print(create_boxplots_separate_pages(seurat_list, sample = sample, celltype_scores = colnames(seurat_list[[sample]]@meta.data)[10:length(colnames(seurat_list[[sample]]@meta.data))]))
+}
+dev.off()
+
+
+
+
+s = "B Cell" # a few folicular b cells, memory b cells, also lit up for vascular smooth muscle and cycling EC
+BCell_cluster_markers <- FindAllMarkers(seurat_list[[s]], only.pos = FALSE)
+write.csv(BCell_cluster_markers,"immune_subclustering/BCell_markers.csv")
+top_B_markers <- BCell_cluster_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 0.5)
+#follicular b cells according to enrichR
+top_B_markers[top_B_markers$cluster==0,]$gene
+top_B_markers[top_B_markers$cluster==1,]$gene
+
+new.cluster.ids <- c('Activated B Cells', 'Naive B Cells')
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "immune_subclustering/Bcells.rds")
+
+s = "Endothelial" # lit up for alveolar fb and pathological fb and other endothelial
+endothelial_cluster_markers <- FindAllMarkers(seurat_list[[s]], only.pos = FALSE)
+write.csv(endothelial_cluster_markers,"immune_subclustering/Endothelial_markers.csv")
+top_endothelial_markers <- endothelial_cluster_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 3)
+
+top_endothelial_markers[top_endothelial_markers$cluster==0,]$gene
+top_endothelial_markers[top_endothelial_markers$cluster==1,]$gene
+top_endothelial_markers[top_endothelial_markers$cluster==2,]$gene
+top_endothelial_markers[top_endothelial_markers$cluster==3,]$gene
+top_endothelial_markers[top_endothelial_markers$cluster==4,]$gene
+top_endothelial_markers[top_endothelial_markers$cluster==5,]$gene
+top_endothelial_markers[top_endothelial_markers$cluster==6,]$gene
+
+# mark 1 as arterial ec and the rest as other
+new.cluster.ids <- c('Other Endothelial', 'Arterial EC', 'Other Endothelial', 'Other Endothelial', 'Mixed EC', 'Mixed EC', 'Mixed EC')
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "immune_subclustering/Endothelial_cells.rds")
+
+s = "Fibroblast"
+fibroblast_cluster_markers <- FindAllMarkers(seurat_list[[s]], only.pos = FALSE)
+write.csv(fibroblast_cluster_markers,"immune_subclustering/fibroblast_markers.csv")
+top_fibroblast_markers <- fibroblast_cluster_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 5)
+
+top_fibroblast_markers[top_fibroblast_markers$cluster==0,]$gene
+top_fibroblast_markers[top_fibroblast_markers$cluster==1,]$gene
+top_fibroblast_markers[top_fibroblast_markers$cluster==2,]$gene
+top_fibroblast_markers[top_fibroblast_markers$cluster==3,]$gene
+top_fibroblast_markers[top_fibroblast_markers$cluster==4,]$gene
+top_fibroblast_markers[top_fibroblast_markers$cluster==5,]$gene
+top_fibroblast_markers[top_fibroblast_markers$cluster==6,]$gene
+top_fibroblast_markers[top_fibroblast_markers$cluster==7,]$gene
+
+
+new.cluster.ids <- c('dCAF', 'myCAF', 'dCAF', 'dCAF', 'Other FB', 'Ependymal Cells', 'dCAF', 'dCAF')
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "immune_subclustering/Fibroblasts.rds")
+
+s = "Myeloid" # cycling EC lights up everywhere except 1
+myeloid_cluster_markers <- FindAllMarkers(seurat_list[[s]], only.pos = FALSE)
+write.csv(myeloid_cluster_markers,"immune_subclustering/myeloid_markers.csv")
+top_myeloid_markers <- myeloid_cluster_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 5)
+
+top_myeloid_markers[top_myeloid_markers$cluster==0,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==1,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==2,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==3,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==4,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==5,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==6,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==7,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==8,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==9,]$gene
+top_myeloid_markers[top_myeloid_markers$cluster==10,]$gene
+
+# 6, 9, monocytes 0,3,4 m2 macrophage, rest other
+# 9 cDC1, 6 3 DC3, 1 Developing.granulocytes.neutrophils, 6 3 macrophage 1, 10 mast cells
+new.cluster.ids <- c('Monocytes', 'Developing Granulocytes Neutrophils', 'Monocytes', 'M1 Macrophage', 'M2 Macrophage', 'Cycling Cells', 'Monocytes', 'Other Myeloid', 'Neutrophils', 'Dendritic Cells', 'Other Myeloid')
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "immune_subclustering/myeloid.rds")
+
+s = "Other" # tumour for 0 and 4?
+other_cluster_markers <- FindAllMarkers(seurat_list[[s]], only.pos = FALSE)
+write.csv(other_cluster_markers,"immune_subclustering/other_markers.csv")
+top_other_markers <- other_cluster_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 6)
+
+top_other_markers[top_other_markers$cluster==0,]$gene
+top_other_markers[top_other_markers$cluster==1,]$gene
+top_other_markers[top_other_markers$cluster==2,]$gene
+top_other_markers[top_other_markers$cluster==3,]$gene
+top_other_markers[top_other_markers$cluster==4,]$gene
+top_other_markers[top_other_markers$cluster==5,]$gene
+top_other_markers[top_other_markers$cluster==6,]$gene
+
+new.cluster.ids <- c('dCAF', 'Cycling EC/Mono Apobec3a/Dendritic', 'CAF', 'Mono Apobec3a/CD8/CD4 NaiveLike/Th1', 'Perivascular Fibroblast/Ependymal/iCAF', 'Endothelial/M1/M2 Macrophage', 'CD8/CD4 NaiveLike/Th1')
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "immune_subclustering/other_cells.rds")
+
+s = "Pericytes" # Cycling B, Stromal, Perivascular Fibroblasts, Adventitial FB, Aleveolar FB, Other FB, Pericytes, Mesothelial FB, Cycling EC, Tfh lights up
+pericyte_cluster_markers <- FindAllMarkers(seurat_list[[s]], only.pos = FALSE)
+write.csv(pericyte_cluster_markers,"immune_subclustering/pericyte_markers.csv")
+top_pericyte_markers <- pericyte_cluster_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 5.5)
+
+top_pericyte_markers[top_pericyte_markers$cluster==0,]$gene
+top_pericyte_markers[top_pericyte_markers$cluster==1,]$gene
+
+new.cluster.ids <- c('Pericyte', 'Pericyte')
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "immune_subclustering/pericytes.rds")
+
+s = "T Cell" # 
+tcell_cluster_markers <- FindAllMarkers(seurat_list[[s]], only.pos = FALSE)
+write.csv(tcell_cluster_markers,"immune_subclustering/Tcell_markers.csv")
+top_tcell_markers <- tcell_cluster_markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 7)
+
+top_tcell_markers[top_tcell_markers$cluster==6,]$gene
+top_tcell_markers[top_tcell_markers$cluster==8,]$gene
+
+# 2, 8 cd8 effector memory, 1,3,5 cd4 naivelike, 0,4 cd8tpex
+# 4 activated t cells, 0 1 3 4 t helper, 1 2 3 naive stem like, 3 1 cd8 naive stem like, 8 5 cd8 activated
+new.cluster.ids <- c('CD8 Tex', 'CD8/CD4 NaiveLike', 'CD8 Effector Memory', 'CD8/CD4 NaiveLike', 'Cycling T Cells', 'Treg', 'Other T Cells', 'Other T Cells', 'CD8 Effector Memory')
+names(new.cluster.ids) <- levels(seurat_list[[s]])
+seurat_list[[s]] <- RenameIdents(seurat_list[[s]], new.cluster.ids)
+seurat_list[[s]]$celltype <- Idents(seurat_list[[s]])
+saveRDS(seurat_list[[s]], "immune_subclustering/Tcells.rds")
+
+
+
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/immune_subclustering_supervised_annotations.pdf")
+for (sample in samples){
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom") + ggtitle(paste0(sample))) 
+  print(DimPlot(seurat_list[[sample]], reduction = "pca",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom") + ggtitle(paste0(sample))) 
+}
+dev.off()
+
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/immune_subclustering_annotations.pdf")
+for (sample in samples){
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'seurat_clusters',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom") + ggtitle(paste0(sample))) 
+  print(DimPlot(seurat_list[[sample]], reduction = "pca",label = T,group.by = 'seurat_clusters',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom") + ggtitle(paste0(sample))) 
+  print(DimPlot(seurat_list[[sample]], reduction = "umap",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom") + ggtitle(paste0(sample))) 
+  print(DimPlot(seurat_list[[sample]], reduction = "pca",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5, pt.size = 2.5) + theme(legend.position="bottom") + ggtitle(paste0(sample))) 
+}
+dev.off()
+
+
+intersect(toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/endothelial.signature.mouse.xlsx', celltype='Cycling.ECs', seurat_object = seurat_list[[sample]])), toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/bcells.signature.mouse.xlsx', celltype='Cycling.B.cells', seurat_object = seurat_list[[sample]])))
+
+#dCAF and intermediate pathological fb have significant overlap
+```
+
+```{r}
+
+group_mapping <- c("191" = "KL",
+                   "20" = "KL",
+                   "22" = "KL",
+                   "23" = "KL-CGASKO",
+                   "24" = "KL",
+                   "25" = "KL-CGASKO",
+                   "26" = "KL-CGASKO",
+                   "27" = "KL-CGASKO",
+                   "28" = "KL-CGASKO",
+                   "29" = "KL",
+                   "30" = "KL-CGASKO",
+                   "31" = "KL",
+                   "32" = "KL",
+                   "33" = "KL")
+
+
+m <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/myeloid.rds")
+m@meta.data$orig.ident <- as.character(m@meta.data$orig.ident)
+m@meta.data$ID_major <- group_mapping[m@meta.data$orig.ident]
+genes_m <- c("MS4A7", "MS4A4", "CD74", "CIITA", "HVCN1", "CXCL3", "CXCL2", "CLEC4D", "LYZ2", "ILIB", "NOS2", "MRC1", "MERTK", "CD86", "S100A8", "S100A9", "XCR1", "BTLA", "CLEC9A", "ID2", "MK167", "TOP2A", "CENPE", "MAGAT4")
+
+desired_order <- c("Monocytes", "Developing Granulocytes Neutrophils", "M1 Macrophage", "M2 Macrophage", "Neutrophils", "Dendritic Cells", "Cycling Cells", "Other Myeloid") 
+m@meta.data$celltype <- factor(m@meta.data$celltype, levels = desired_order)
+
+t <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/Tcells.rds")
+t@meta.data$orig.ident <- as.character(t@meta.data$orig.ident)
+t@meta.data$ID_major <- group_mapping[t@meta.data$orig.ident]
+genes_t <- c("LAG3", "HAVCR2", "CXCR6", "CD3G", "SELL", "LEF1", "TCF7", "IL7R", "PECAM", "FASL", "GZMA", "IL2RB", "MK167", "TOP2A", "CENPP", "FOXP3", "IL2RA", "CTLA4", "CD4", "PTPRK", "PBX1")
+
+desired_order <- c("CD8 Tex", "CD8/CD4 NaiveLike", "CD8 Effector Memory", "Cycling T Cells", "Treg", "Other T Cells") 
+t@meta.data$celltype <- factor(t@meta.data$celltype, levels = desired_order)
+
+pdf('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/violins.pdf', height = 15)
+print(VlnPlot(m, features = genes_m, group.by = 'celltype', pt.size = 0, assay = 'RNA',
+        stack = T, flip = T,split.by = 'ID_major', cols = c("red", "blue")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)))
+
+print(VlnPlot(t, features = genes_t, group.by = 'celltype', pt.size = 0, assay = 'RNA',
+        stack = T, flip = T,split.by = 'ID_major', cols = c("red", "blue")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)))
+dev.off()
+
+
+pdf('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/violins_ungrouped.pdf', height = 15)
+print(VlnPlot(m, features = genes_m, group.by = 'celltype', pt.size = 0, assay = 'RNA',
+        stack = T, flip = T) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), legend.position = "none"))
+
+print(VlnPlot(t, features = genes_t, group.by = 'celltype', pt.size = 0, assay = 'RNA',
+        stack = T, flip = T) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), legend.position = "none"))
+dev.off()
+
+
+
+```
+
+```{r}
+
+integrated <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/integration_with_celltypes.rds")
+tcells <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/Tcells.rds")
+myeloid <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/myeloid.rds")
+bcells <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/Bcells.rds")
+ecells <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/Endothelial_cells.rds")
+fcells <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/Fibroblasts.rds")
+ocells <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/other_cells.rds")
+pcells <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/pericytes.rds")
+
+
+tcell_metadata <- tcells@meta.data[, "celltype", drop = FALSE]
+mcell_metadata <- myeloid@meta.data[, "celltype", drop = FALSE]
+bcell_metadata <- bcells@meta.data[, "celltype", drop = FALSE]
+ecell_metadata <- ecells@meta.data[, "celltype", drop = FALSE]
+fcell_metadata <- fcells@meta.data[, "celltype", drop = FALSE]
+ocell_metadata <- ocells@meta.data[, "celltype", drop = FALSE]
+pcell_metadata <- pcells@meta.data[, "celltype", drop = FALSE]
+
+colnames(tcell_metadata) <- "sub_celltype"
+colnames(mcell_metadata) <- "sub_celltype"
+colnames(bcell_metadata) <- "sub_celltype"
+colnames(ecell_metadata) <- "sub_celltype"
+colnames(fcell_metadata) <- "sub_celltype"
+colnames(ocell_metadata) <- "sub_celltype"
+colnames(pcell_metadata) <- "sub_celltype"
+
+metadata <- rbind(tcell_metadata, mcell_metadata, bcell_metadata, ecell_metadata, fcell_metadata, ocell_metadata, pcell_metadata)
+
+# Ensure the cell names are consistent
+metadata <- metadata[rownames(metadata) %in% colnames(integrated), , drop = FALSE]
+
+
+# Add the sub_celltype to the larger object
+integrated <- AddMetaData(integrated, metadata = metadata)
+
+integrated@meta.data$sub_celltype <- as.character(integrated@meta.data$sub_celltype)
+
+integrated@meta.data$sub_celltype[is.na(integrated@meta.data$sub_celltype)] <- "Malignant"
+
+
+integrated@meta.data$sub_celltype[integrated@meta.data$sub_celltype == "Perivascular Fibroblast/Ependymal/iCAF"] <- "Perivascular Fibroblast"
+integrated@meta.data$sub_celltype[integrated@meta.data$sub_celltype == "Mono Apobec3a/CD8/CD4 NaiveLike/Th1"] <- "Monocytes"
+integrated@meta.data$sub_celltype[integrated@meta.data$sub_celltype == "CD8/CD4 NaiveLike/Th1"] <- "CD8/CD4 NaiveLike"
+integrated@meta.data$sub_celltype[integrated@meta.data$sub_celltype == "Cycling EC/Mono Apobec3a/Dendritic"] <- "Cycling"
+integrated@meta.data$sub_celltype[integrated@meta.data$sub_celltype == "Endothelial/M1/M2 Macrophage"] <- "Macrophage"
+integrated@meta.data$sub_celltype[integrated@meta.data$sub_celltype == "Cycling"] <- "Cycling Cells"
+
+ocells@meta.data$celltype <- as.character(ocells@meta.data$celltype)
+ocells@meta.data$celltype[ocells@meta.data$celltype == "Perivascular Fibroblast/Ependymal/iCAF"] <- "Perivascular Fibroblast"
+ocells@meta.data$celltype[ocells@meta.data$celltype == "Mono Apobec3a/CD8/CD4 NaiveLike/Th1"] <- "Monocytes"
+ocells@meta.data$celltype[ocells@meta.data$celltype == "CD8/CD4 NaiveLike/Th1"] <- "CD8/CD4 NaiveLike"
+ocells@meta.data$celltype[ocells@meta.data$celltype == "Cycling EC/Mono Apobec3a/Dendritic"] <- "Cycling"
+ocells@meta.data$celltype[ocells@meta.data$celltype == "Endothelial/M1/M2 Macrophage"] <- "Macrophage"
+ocells@meta.data$celltype[ocells@meta.data$celltype == "Cycling"] <- "Cycling Cells"
+
+
+# Malignant (single color)
+malignant_colors <- c("Malignant" = "#FF0000")  # Red
+
+# T Cells (6 subtypes) - reddish-brown palette
+tcell_colors <- c(
+  "CD8 Tex" = "#8B0000",  # Dark Red
+  "Other T Cells" = "#A52A2A",  # Brown
+  "CD8/CD4 NaiveLike" = "#B22222",  # Firebrick
+  "CD8 Effector Memory" = "#CD5C5C",  # Indian Red
+  "Cycling T Cells" = "#D2691E",  # Chocolate
+  "Treg" = "#BC8F8F"   # Rosy Brown
+)
+
+# Fibroblasts (5 subtypes) - greenish palette
+fibroblast_colors <- c(
+  "dCAF" = "#006400",  # Dark Green
+  "Pericyte" = "#228B22",  # Forest Green
+  "CAF" = "#32CD32",  # Lime Green
+  "Ependymal Cells" = "#7FFF00",  # Chartreuse
+  "Perivascular Fibroblast" = "#ADFF2F",   # Green Yellow
+  "myCAF" = "#3FFF20",
+  "Other FB" = "lightgreen"
+)
+
+# Myeloid (5 subtypes) - blue-ish palette
+myeloid_colors <- c(
+  "M1 Macrophage" = "#00008B",  # Dark Blue
+  "Dendritic Cells" = "#1E90FF",  # Dodger Blue
+  "M2 Macrophage" = "#4682B4",  # Steel Blue
+  "Monocytes" = "#87CEEB",  # Sky Blue
+  "Developing Granulocytes Neutrophils" = "#ADD8E6",   # Light Blue
+  "Macrophage" = "#87BEEB",
+  "Other Myeloid" = "#67CEEB",
+  "Cycling Cells" = "#13CEEB",
+  "Neutrophils" = "#87CEBB",
+  "Activated B Cells" = "pink",
+  "Naive B Cells" = "magenta"
+)
+
+endothelial_colors <- c(
+  "Arterial EC" = "yellow",
+  "Other Endothelial" = "#f6dea5",
+  "Mixed EC" = "#F1dea0"
+)
+
+
+# Combine all colors into one vector
+custom_colors <- c(
+  malignant_colors,
+  tcell_colors,
+  fibroblast_colors,
+  myeloid_colors, endothelial_colors
+)
+
+
+
+table(integrated$sub_celltype)
+pdf('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/all_umap_pca.pdf')
+DimPlot(integrated, group.by ='sub_celltype', cols = custom_colors) + NoLegend()
+DimPlot(integrated, group.by ='sub_celltype', cols = custom_colors, label = T) + NoLegend()
+DimPlot(integrated, group.by ='sub_celltype', cols = custom_colors, reduction = 'pca') + NoLegend()
+DimPlot(integrated, group.by ='sub_celltype', cols = custom_colors, reduction = 'pca', label = T) + NoLegend()
+p <- DimPlot(integrated, group.by = "sub_celltype", cols = custom_colors)
+# Extract the legend using ggplot2 functions
+
+legend <- cowplot::get_legend(p)
+# Print the legend
+cowplot::plot_grid(legend)
+dev.off()
+
+
+p <- DimPlot(integrated, group.by = "sub_celltype", label = T)
+# Extract the legend using ggplot2 functions
+
+legend <- cowplot::get_legend(p)
+pdf('/Users/zackbrodtman/Downloads/legend.pdf')
+# Print the legend
+cowplot::plot_grid(legend)
+dev.off()
+saveRDS(integrated, '~/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Entire Data/integrated_object.rds')
+
+p <- subset(integrated, sub_celltype != 'Malignant')
+pdf('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Entire Data/without_malignant.pdf')
+DimPlot(p, group.by ='sub_celltype', cols = custom_colors) + NoLegend()
+DimPlot(p, group.by ='sub_celltype', cols = custom_colors, label = T) + NoLegend()
+DimPlot(p, group.by ='sub_celltype', cols = custom_colors, reduction = 'pca') + NoLegend()
+DimPlot(p, group.by ='sub_celltype', cols = custom_colors, reduction = 'pca', label = T) + NoLegend()
+
+dev.off()
+
+
+celltypes <- c(tcells, myeloid, bcells, ecells, fcells, ocells, pcells)
+
+for (type in celltypes){
+  pdf(paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', type$celltype[[1]], '.pdf'))
+  print(DimPlot(type, group.by ='celltype', cols = custom_colors) + NoLegend())
+  print(DimPlot(type, group.by ='celltype', cols = custom_colors, label = T) + NoLegend())
+  print(DimPlot(type, group.by ='celltype', cols = custom_colors, reduction = 'pca') + NoLegend())
+  print(DimPlot(type, group.by ='celltype', cols = custom_colors, reduction = 'pca', label = T) + NoLegend())
+  dev.off()
+}
+
+for (type in celltypes){
+  print(type$celltype[[1]])
+  #saveRDS(type, paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', type, '.rds'))
+}
+
+saveRDS(tcells, paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', 'T_Cells', '.rds'))
+saveRDS(ecells, paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', 'Endothelial', '.rds'))
+saveRDS(myeloid, paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', 'Myeloid', '.rds'))
+saveRDS(ocells, paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', 'Other', '.rds'))
+saveRDS(bcells, paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', 'B_Cells', '.rds'))
+saveRDS(fcells, paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', 'Fibroblasts', '.rds'))
+saveRDS(pcells, paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/', 'Pericyte', '.rds'))
+
+```
+
+
+
+
+

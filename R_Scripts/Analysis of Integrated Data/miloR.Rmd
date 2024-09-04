@@ -1,0 +1,291 @@
+---
+title: "milo_lkb1"
+output: html_document
+date: "2024-05-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+# Author: Somnath Tagore, Ph.D. Title: Milo analysis
+# Script Name: milo.R 
+# Last Updated: 06/24/2022
+
+# Packages required for this analysis
+#BiocManager::install("miloR")
+library(miloR)
+library(SingleCellExperiment)
+library(dplyr)
+library(patchwork)
+library(Seurat)
+library(beeswarm)
+library(rstatix)
+library(ggplot2)
+library(ggprism)
+library(patchwork)
+library(magrittr)
+library(ggpubr)
+library(statmod)
+library(scater)
+
+group_mapping <- c("191" = "KL-MSA",
+                   "20" = "KL-MSA",
+                   "22" = "KL-DMSO",
+                   "23" = "KL-CGASKO-DMSO",
+                   "24" = "KL-DMSO",
+                   "25" = "KL-CGASKO-MSA",
+                   "26" = "KL-CGASKO-MSA",
+                   "27" = "KL-CGASKO-DMSO",
+                   "28" = "KL-CGASKO-DMSO",
+                   "29" = "KL-DMSO",
+                   "30" = "KL-CGASKO-MSA",
+                   "31" = "KL-MSA",
+                   "32" = "KL-MSA",
+                   "33" = "KL-MSA")
+
+
+# Read data
+
+pathofdata <- '/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Immune Subclusters/'
+#celltype <-'Fibroblasts'
+#celltype <-'Myeloid'
+#celltype <-'Other'
+#celltype <-'Pericyte'
+#celltype <-'Endothelial'
+#celltype <-'T_cells'
+#celltype <-'B_cells' #no b cells from KL-CGASKO-MSA2
+#celltype <- 'integrated_object'
+
+pbmc_small <- readRDS(file=paste0(pathofdata,celltype,'.rds'))
+#pbmc_small <- subset(pbmc_small, subset = sub_celltype!='Malignant')
+pbmc_small@meta.data$orig.ident <- as.character(pbmc_small@meta.data$orig.ident)
+pbmc_small@meta.data$ID_major <- group_mapping[pbmc_small@meta.data$orig.ident]
+table(pbmc_small$ID_major)
+
+pathofdata <- "/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/MiloR/By Celltype/"
+#pbmc_small <- subset(pbmc_small,subset=ID_major%in%c('KL-MSA','KL-CGASKO-MSA'))
+#pbmc_small <- subset(pbmc_small,subset=ID_major%in%c('KL-CGASKO-DMSO','KL-CGASKO-MSA'))
+pbmc_small <- subset(pbmc_small,subset=ID_major%in%c('KL-DMSO','KL-CGASKO-DMSO'))
+
+pbmc_small[['barcodes']] <- rownames(pbmc_small@meta.data)
+#DefaultAssay(pbmc_small) <- 'integrated'
+
+# Create a single cell experiment object
+pbmc_small_sce <- as.SingleCellExperiment(pbmc_small)
+pbmc_small_sce
+
+# Run Milo for test
+pbmc_small_milo <- Milo(pbmc_small_sce)
+
+# build graph
+traj_milo <- buildGraph(pbmc_small_milo, k = 50, d = 30)
+
+# create neighborhoods
+traj_milo <- makeNhoods(traj_milo, prop = 0.5, k = 50, d=30, refined = TRUE)
+
+milo.meta <- pbmc_small@meta.data
+
+# trajectory design2
+traj_milo <- countCells(traj_milo, meta.data = data.frame(colData(traj_milo)), sample='orig.ident')
+head(nhoodCounts(traj_milo))
+traj_milo
+
+traj_design <- as.data.frame(xtabs(~ ID_major + orig.ident, data=milo.meta))
+traj_design <- traj_design[traj_design$Freq > 0, ]
+rownames(traj_design) <- traj_design$orig.ident
+traj_design <- traj_design[colnames(nhoodCounts(traj_milo)),]
+
+milo.res <- testNhoods(traj_milo, design=~ID_major, design.df=traj_design)
+head(milo.res)
+
+#embryo_design and test neighborhoods
+traj_milo <- calcNhoodDistance(traj_milo, d=30)
+da_results <-milo.res
+
+#write.csv(traj_design,file=paste0(pathofdata, celltype, '/LKB1.KL-MSA2.vs.KL-CGASKO-MSA2.',celltype,'.v2.4.1.milo.traj.design.k50d30.csv'))
+#write.csv(traj_design,file=paste0(pathofdata, celltype, '/LKB1.KL-CGASKO-DMSO.vs.KL-CGASKO-MSA.',celltype,'.v2.4.1.milo.traj.design.k50d30.csv'))
+write.csv(traj_design,file=paste0(pathofdata, celltype, '/LKB1.KL-DMSO.vs.KL-CGASKO-DMSO.',celltype,'.v2.4.1.milo.traj.design.k50d30.csv'))
+dim(traj_milo@nhoodCounts)
+
+# annotate neighborhoods as per manual annotation
+da_results <- annotateNhoods(traj_milo, da_results, coldata_col = "celltype")
+head(da_results)
+
+# build neighborhood graph
+traj_milo <- buildNhoodGraph(traj_milo)
+
+
+tumor_nontumor<-da_results
+#N = 100
+DF = tibble(Celltype = tumor_nontumor$Endothelials_groups,
+            logFC = tumor_nontumor$logFC,
+            SpatialFDR = tumor_nontumor$SpatialFDR,
+            PValue = tumor_nontumor$PValue,
+            nh_size = colSums(nhoods(traj_milo)),
+            Nhood = tumor_nontumor$Nhood)#,
+
+da_results$nh_size = colSums(nhoods(traj_milo)) 
+
+#write.csv(da_results,file=paste0(pathofdata, celltype, '/LKB1.KL-MSA2.vs.KL-CGASKO-MSA2.',celltype,'.v2.4.1.milo_da_results.csv'))
+#write.csv(da_results,file=paste0(pathofdata, celltype, '/LKB1.KL-CGASKO-DMSO.vs.KL-CGASKO-MSA.',celltype,'.v2.4.1.milo_da_results.csv'))
+write.csv(da_results,file=paste0(pathofdata, celltype, '/LKB1.KL-DMSO.vs.KL-CGASKO-DMSO.',celltype,'.v2.4.1.milo_da_results.csv'))
+
+#pdf(file=paste0(pathofdata, celltype, '/LKB1.KL-MSA2.vs.KL-CGASKO-MSA2.',celltype,'.v2.4.1.milo_da_results_plotDAbeeswarm_k50d30.1.pdf'),height=10,width=15)
+#pdf(file=paste0(pathofdata,celltype, '/LKB1.KL-CGASKO-DMSO.vs.KL-CGASKO-MSA2.',celltype,'.v2.4.1.milo_da_results_plotDAbeeswarm_k50d30.1.pdf'),height=10,width=15)
+pdf(file=paste0(pathofdata, celltype, '/LKB1.KL-DMSO.vs.KL-CGASKO-DMSO.',celltype,'.v2.4.1.milo_da_results_plotDAbeeswarm_k50d30.1.pdf'),height=10,width=15)
+p<-median_logFC <- median(da_results$logFC)
+
+# Create a new variable to indicate the color based on both PValue and logFC
+da_results$color <- ifelse(da_results$PValue < 0.05 & da_results$logFC > median_logFC, "blue", 
+                            ifelse(da_results$PValue < 0.05 & da_results$logFC <= median_logFC, "red", "grey"))
+
+# Plot with the new color variable
+ggplot(da_results, aes(x = logFC, y = celltype)) +
+  geom_violin(fill = "grey", scale = 'width', alpha = 0) + # Set fill color to grey
+  geom_jitter(aes(size = nh_size, color = color), alpha = 0.5)+# Overlay colored points
+  scale_color_identity() + # Use identity scale since color is pre-defined
+  ggtitle("KL-DMSO vs KL-CGASKO-DMSO \nPositive Log2FC = Enriched in KL-DMSO \nNegative Log2FC = Enriched in KL-CGASKO-DMSO") +
+  theme_minimal()
+
+dev.off()
+
+# Calculate weighted mean group-wise
+result <- da_results %>%
+  group_by(celltype) %>%
+  summarise(weighted_mean = weighted.mean(logFC, 1-SpatialFDR))
+
+# View the result
+#print(result)
+#write.csv(result,file='/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/MiloR/All Cells/weighted_mean.csv')
+
+#write.csv(result,file=paste0(pathofdata, celltype, '/LKB1.KL-MSA2.vs.KL-CGASKO-MSA2.',celltype,'.v2.4.1.milo_da_results_weighted_mean.csv'))
+#write.csv(result,file=paste0(pathofdata, celltype, '/LKB1.KL-CGASKO-DMSO.vs.KL-CGASKO-MSA.',celltype,'.v2.4.1.milo_da_results_weighted_mean.csv'))
+write.csv(result,file=paste0(pathofdata, celltype, '/LKB1.KL-DMSO.vs.KL-CGASKO-DMSO.',celltype,'.v2.4.1.milo_da_results_weighted_mean.csv'))
+
+# Assuming da_results has a column 'logFC' for log2 fold changes and 'cell_type' for cell types
+# Calculate the mean logFC for each sub_celltype
+da_results <- da_results %>%
+  group_by(celltype) %>%
+  mutate(logFC_centered = logFC - mean(logFC))
+
+
+#custom_order <- c("Activated B Cells", "Naive B Cells", "Developing Granulocytes Neutrophils", "Neutrophils","Monocytes", "M1 Macrophage", "CD8/CD4 NaiveLike",  "Treg", #"Cycling T Cells", "CD8 Effector Memory", "Other T Cells", "CD8 Tex", "Other Endothelial", "Mixed EC", "Perivascular Fibroblast","dCAF", "CAF", "Ependymal Cells", "myCAF", #"Other FB", "Cycling Cells")
+
+result <- arrange(result, desc(weighted_mean))
+custom_order <- result$celltype
+  
+da_results$celltype <- factor(da_results$celltype, levels = custom_order)
+
+# Step 3: Order the dataframe by the celltype column
+da_results <- da_results %>%
+  arrange(celltype)
+pdf(paste0('/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/MiloR/By Celltype/', celltype, '/DMSO_CGASKO_DMSO_uncentered_and_centered.pdf'))
+
+ggplot(da_results, aes(x = logFC, y = celltype)) +
+  geom_jitter(aes(color = celltype, alpha = -PValue), height = 0.3, width = 0.3, size = 2) +
+  theme_classic() +
+  xlab("Differential abundance\nlog2 (fold change)") +
+  ylab("") +# xlim(-2.5, 2.5) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 0, linetype = "solid") +
+  scale_color_manual(values = custom_colors) +scale_y_discrete(limits = custom_order)
+
+ggplot(da_results, aes(x = logFC_centered, y = celltype)) +
+  geom_jitter(aes(color = celltype, alpha = -PValue), height = 0.3, width = 0.3, size = 2) +
+  theme_classic() +
+  xlab("Differential abundance\nlog2 (fold change)") +
+  ylab("") +# xlim(-2.5, 2.5) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 0, linetype = "solid") +
+  scale_color_manual(values = custom_colors) +scale_y_discrete(limits = custom_order)
+
+#ggplot(da_results, aes(x = logFC, y = reorder(sub_celltype, logFC))) +
+#  geom_jitter(aes(color = sub_celltype), height = 0.3, width = 0.3, size = 2, alpha = 0.5) +
+#  theme_classic() +
+#  xlab("Differential abundance\nlog2 (fold change)") +
+#  ylab("") + xlim(-5,5)+
+#  theme(legend.position = "none") +
+#  geom_vline(xintercept = 0, linetype = "solid") +
+#  scale_color_manual(values = custom_colors)
+dev.off()
+
+#saveRDS(traj_milo, '/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/MiloR/All Cells/traj_milo.rds')
+#write.csv(traj_design, '/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/MiloR/All Cells/traj_design.csv')
+#saveRDS(da_results, '/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/MiloR/All Cells/da_results.rds')
+#write.csv(da_results, '/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/MiloR/All Cells/da_results.csv')
+
+
+table(da_results$sub_celltype)
+```
+
+
+## plot
+
+```{r}
+# Load necessary libraries
+library(Seurat)
+library(ComplexHeatmap)
+library(circlize)
+library(enrichR)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(readxl)
+library(clusterProfiler)
+library(enrichplot)
+listEnrichrSites()
+setEnrichrSite("Enrichr") # Human genes
+websiteLive <- TRUE
+dbs <- listEnrichrDbs()
+if (is.null(dbs)) websiteLive <- FALSE
+if (websiteLive) head(dbs)
+
+dbs <- c("MSigDB_Hallmark_2020")
+
+# Step 1: Extract IFN-α/β Hallmark Pathway Genes
+# Replace with the actual gene names from the Hallmark pathway
+hallmark_genes <- c("GENE1", "GENE2", "GENE3", "GENE4")  # Add all genes in the IFN-α/β pathway
+
+# Get expression data for these genes
+expression_data <- GetAssayData(integrated, slot = "data")[hallmark_genes, ]
+
+# Step 2: Calculate Enrichment Scores or Differences Across Treatment Groups
+# Assume you have a metadata column 'treatment_group'
+# and use the GSVA package or a simple mean to calculate enrichment.
+
+# Example: Calculate mean expression per treatment group
+mean_expression <- aggregate(t(expression_data), by = list(LargerObject@meta.data$treatment_group), FUN = mean)
+rownames(mean_expression) <- mean_expression$Group.1
+mean_expression <- mean_expression[, -1]  # Remove group column
+
+# Step 3: Create Heatmap with Annotation
+# Use the ComplexHeatmap package to create a heatmap with annotation
+heatmap <- Heatmap(as.matrix(expression_data),
+                   name = "Expression",
+                   show_row_names = TRUE,
+                   show_column_names = FALSE,
+                   cluster_rows = TRUE,
+                   cluster_columns = TRUE,
+                   top_annotation = HeatmapAnnotation(df = LargerObject@meta.data[, "treatment_group", drop = FALSE]))
+
+# Annotation for enrichment/lower representation
+annotation <- rowAnnotation(
+  Enrichment = anno_barplot(mean_expression,
+                            border = TRUE,
+                            gp = gpar(fill = c("blue", "red")),
+                            width = unit(2, "cm"))
+)
+
+# Combine Heatmap and Annotation
+combined <- heatmap + annotation
+
+# Draw the Heatmap
+draw(combined)
+
+
+```
+
+

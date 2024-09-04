@@ -1,0 +1,376 @@
+---
+title: "LC191_analysis"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+print(paste('Start:',Sys.time()))
+
+library(dplyr)
+library(fields)
+library(KernSmooth)
+library(DoubletFinder)
+library(scCustomize)
+library(openxlsx)
+library(gplots)
+library(ggplot2)
+library(ggrastr)
+library(DropletUtils)
+library(SingleR)
+library(ROCR)
+library(parallel)
+library(celldex)
+library(SingleCellExperiment)
+#library(scater)
+library(pheatmap)
+library(Matrix)
+library(stringi)
+library(Seurat)
+
+pat <- 'LC191'
+doublet_rate <-0.004
+
+##### Loading, merging, QC, dimension reduction #####
+### Load dataset
+cell_bender_mat <- Read_CellBender_h5_Mat(file_name = "/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/LC191/feature_bc_matrix_bent_filtered.h5")
+rownames(cell_bender_mat) <- toupper(rownames(cell_bender_mat))
+
+### Initialize the Seurat object with the raw (non-normalized data)
+seu_raw <- CreateSeuratObject(counts = pmax(cell_bender_mat, 0), 
+                              min.cells = 3, min.features = 300)
+
+# Annotate MT genes
+seu_raw$percent.mt <- PercentageFeatureSet(object = seu_raw, pattern = "^MT-")
+
+# Annotate
+seu_raw$sample<-pat
+#seu_raw$patient<-stri_split_fixed(str = pat, pattern = "_", n = 2)[[1]][1]
+#seu_raw$condition<-stri_split_fixed(str = pat, pattern = "_", n = 2)[[1]][2]
+seu_raw$barcode_orig<-rownames(seu_raw@meta.data)
+#seu_raw$barcode_pat<-paste0(seu_raw$barcode_orig,'_',pat)
+
+
+# Add clinical data
+#clin<-read.csv('data/clin.csv',na.strings = '')
+#seu_raw@meta.data<-left_join(seu_raw@meta.data,clin,by='sample')
+rownames(seu_raw@meta.data)<-seu_raw$barcode_orig
+
+
+### subset 
+minFeature<-200
+maxFeature<- 12000
+minCount<- 800
+maxCount<- 70000
+maxMT<-15
+
+seu <- subset(seu_raw, subset = nFeature_RNA > minFeature & nFeature_RNA < maxFeature & 
+                nCount_RNA > minCount & nCount_RNA < maxCount & 
+                percent.mt < maxMT)
+
+
+
+### Workflow RNA
+seu <- NormalizeData(seu)
+seu <- FindVariableFeatures(seu)
+seu <- ScaleData(seu)
+seu <- RunPCA(seu)
+ElbowPlot(seu, ndims = 50)
+
+```
+
+### Doublet Removal
+
+```{r error=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+# Find optimal pK for doubletFinder function
+sweep.list <- paramSweep_v3(seu, PCs = 1:45)
+sweep.stats <- summarizeSweep(sweep.list)
+#bcmvn <- find.pK(sweep.stats) <---- in hidden chunk to prevent long output
+```
+```{r include=FALSE}
+bcmvn <- find.pK(sweep.stats)
+```
+```{r error=FALSE, message=FALSE, warning=FALSE, results=FALSE}
+pK <- bcmvn %>% 
+  dplyr::filter(BCmetric == max(BCmetric)) %>%
+  dplyr::select(pK) 
+pK <- as.numeric(as.character(pK[[1]]))
+
+seu <- FindNeighbors(seu, dims = 1:45)
+seu <- FindClusters(seu, resolution = 0.5)
+
+## Homotypic doublet proportion estimate
+annotations <- seu@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations) 
+nExp.poi <- round(doublet_rate * nrow(seu@meta.data)) 
+nExp.poi.adj <- round(nExp.poi * (1 - homotypic.prop))
+
+# Run doubletFinder
+seu <- doubletFinder_v3(seu, PCs = 1:45, pN = 0.25, pK = pK, nExp = nExp.poi.adj, reuse.pANN = FALSE)
+
+metadata <- seu@meta.data
+colnames(metadata)[10] <- "doublet_finder"
+seu@meta.data <- metadata 
+```
+
+```{r}
+# visualize doublets
+seu <- RunUMAP(seu, dims = 1:45)
+DimPlot(seu, reduction = 'umap', group.by = "doublet_finder")
+
+# number of singlets and doublets
+table(seu@meta.data$doublet_finder)
+predicted_doublets <- table(seu@meta.data$doublet_finder)['Doublet']
+
+# subset and save
+data.singlets <- subset(seu, doublet_finder == "Singlet")
+seu <- data.singlets
+remove(data.singlets)
+```
+
+```{r}
+
+seu <- FindNeighbors(seu, dims = 1:45)
+seu <- FindClusters(seu, resolution = 0.5)
+
+### cell type identification
+seu_sce <- as.SingleCellExperiment(seu)
+
+mouse_ref<-MouseRNAseqData()
+pred_main <- SingleR(test = seu_sce, ref = mouse_ref, labels = mouse_ref$label.main)
+pruneScores(pred_main)
+seu[['celltype_main']]<-pred_main$pruned.labels
+pred_fine <- SingleR(test = seu_sce, ref = mouse_ref, labels = mouse_ref$label.fine)
+pruneScores(pred_fine)
+seu[['celltype_fine']]<-pred_fine$pruned.labels
+
+## using celltype markers
+
+immune = toupper(c("Cd4", "Cd8", "Tox", "Gzmb", "Lag3", "Cd274", "Pdcd1", "Stat1", "Gbp1", "Gbp5", "Mx1", "Mx2", "Ifi44", "Siglec1", "Rnase1", "Cd163", "Mertk", "Marco", "Cyp27a1", "Pparg", "Ano5", "Lta4h", "Fbp1", "Denndc", "Itgax", "Camk1d", "Abcc5", "Csf2ra", "Nampt", "Cd63", "Stat4", "Runx2", "Itga4", "Ikzf1", "Tnfaip3", "Cd69", "Jak1", "Itga", "Cd44", "Mgat5", "Prkca", "Bach2", "Nck2", "Celf2", "Camk4", "Tnik", "Dthd1", "Ptprc", "Pyhin1", "Ccl5", "Lyst", "Themis", "Cblb", "Iqgap2", "Itk", "Ets1", "Skap1", "Elmo1", "Itga4", "Cd96", "Cd44", "Ifi6", "NFAT5", "Cd66b", "Cd33", "Mpo", "Cd15"))
+
+tumour = toupper(c("Sftpa1", "Sftpb", "Sftpc", "Shh", "Ptch", "Fgf8", "Fgf10", "Hnf4", "Cdh2", "Vegfr", "Vegf", "Pdgfr", "Pdgfr", "Fgf", "Fgfr", "Ra", "Rar", "Ccsp", "Sox2", "Sox9", "Epcam", "Stk11"))
+
+valid_immune <- immune[immune %in% rownames(seu@assays$RNA@counts)]
+valid_tumour <- tumour[tumour %in% rownames(seu@assays$RNA@counts)]
+
+seu <- AddModuleScore(object = seu, features = valid_immune, name = "immune_score")
+FeaturePlot(object = seu, features = "immune_score1")
+seu <- AddModuleScore(object = seu, features = valid_tumour, name = "tumour_score")
+FeaturePlot(object = seu, features = "tumour_score1")
+
+
+```
+
+
+```{r}
+generateCellTypeLists <- function(signature_file_path, celltype, seurat_object) {
+# Load the Excel file with specific cell types and associated genes
+cell_signatures_xl <- read.xlsx(signature_file_path, detectDates = FALSE)
+
+# Initialize an empty list to store gene sets for specific cell types
+signature_list <- list()
+
+# Iterate through the columns (specific cell types) in the Excel file
+for (i in 1:ncol(cell_signatures_xl)) {
+  cell_type <- colnames(cell_signatures_xl)[i]
+  genes <- cell_signatures_xl[, i]
+  
+  # Filter out empty gene names (if any)
+  genes <- genes[!is.na(genes) & genes != ""]
+  
+  # Store the genes associated with the specific cell type in the list
+  signature_list[[cell_type]] <- genes
+}
+
+
+return(
+signature_list[[celltype]])
+}
+
+setwd("/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC")
+
+### b cells
+
+b_cell_types <- c("Plasma.cells",	"Activated.B.cells",
+                  "Cycling.B.cells",	"Stromal.cells",	"Follicular.B.cells",	#"Germinal.center.B.cells",
+                  "Memory.B.cells",	#"Naive.B.cells",	"Transitional.B.cells",
+                  "Large.pre-B.cells"#,
+                  #"Pre-pro-B.cells", "Pro-B.cells"
+                  )
+
+for (type in b_cell_types){
+  gene_list <- generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/bcells.signature.mouse.xlsx', celltype=type, seurat_object = seu)
+  seu <-  AddModuleScore(object = seu, features = gene_list[gene_list %in% rownames(seu@assays$RNA@counts)], name = "B Cell Score")
+  print(FeaturePlot(object = seu, features = "B Cell Score1")+ggtitle(type))
+}
+
+
+### cardiomyocytes
+
+cardiomyocyte_types <- c("Ventricular.Cardiomyocyte") #"Atrial.Cardiomyocyte", "Cardiac.progenitor.cells")
+
+for (type in cardiomyocyte_types){
+  gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/cardiomyocytes.signature.mouse.xlsx', celltype=type, seurat_object = seu))
+  seu <-  AddModuleScore(object = seu, features = gene_list[gene_list %in% rownames(seu@assays$RNA@counts)], name = "Cardiomyocyte Score")
+  print(FeaturePlot(object = seu, features = "Cardiomyocyte Score1")+ggtitle(type))
+}
+
+### endothelial
+
+endothelial_types <- c("Other.Endothelial",	"Venous.ECs",	"Lymphatic.ECs", "Arterial.ECs", "Cycling.ECs")
+
+for (type in endothelial_types){
+  gene_list <- generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/endothelial.signature.mouse.xlsx', celltype=type, seurat_object = seu)
+  seu <-  AddModuleScore(object = seu, features = gene_list[gene_list %in% rownames(seu@assays$RNA@counts)], name = "Endothelial Score")
+  print(FeaturePlot(object = seu, features = "Endothelial Score1")+ggtitle(type))
+}
+
+### fibroblasts
+fibroblast_types <- c("Perivascular.Fibroblasts",	"CAFs",	"Mesangial.Fibroblasts", "Ependymal.Cells",	
+                      "myCAF",	"dCAF",
+                      "iCAF",	"pCAF", "Intermediate.pathological.FB",
+                      "Adventitial.FB",	"Alveolar.FB",	
+                      "Pathological.FB", "Other.FB", "Airway.smooth.muscle",	"Pericyte",	"Vascular.smooth.muscle",
+                      "Mesothelial.FB")
+
+for (type in fibroblast_types){
+  gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/fibroblasts.signature.mouse.xlsx', celltype=type, seurat_object = seu))
+  seu <-  AddModuleScore(object = seu, features = gene_list[gene_list %in% rownames(seu@assays$RNA@counts)], name = "Fibroblast Score")
+  print(FeaturePlot(object = seu, features = "Fibroblast Score1")+ggtitle(type))
+}
+
+### myeloid
+myeloid_types <- c("MacrophagesM1", 'MacrophagesM2',
+  "M1_Macrophage_Polarization",	"M2_Macrophage_Polarization", "Mono_CD16", "Mono_CD16_C1qa",  "Mono_Apobec3b",
+  "Mono_Apobec3a",	"Mono_CD14_Antiviral",	"Mono_CD14",	'Mono_CD14_Inflam',	"MonoT_Doublet",	"Monocyte",	"Inflammatory_monocytes",	"resident_monocytes")
+
+for (type in myeloid_types){
+  gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/myeloid.bakhoum.mouse.xlsx', celltype=type, seurat_object = seu))
+  seu <-  AddModuleScore(object = seu, features = gene_list[gene_list %in% rownames(seu@assays$RNA@counts)], name = "Myeloid Score")
+  print(FeaturePlot(object = seu, features = "Myeloid Score1")+ggtitle(type))
+}
+
+### T cells
+Tcell_types <- c("Tfh",	"CD8_NaiveLike",	"CD8_EffectorMemory",	"CD8_EarlyActiv",	"Th1",	"CD4_NaiveLike",	"CD8_Tpex",	"CD8_Tex",	"Treg")
+
+for (type in Tcell_types){
+  gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/TIL_tcell_signature_mouse.xlsx', celltype=type, seurat_object = seu))
+  seu <-  AddModuleScore(object = seu, features = gene_list[gene_list %in% rownames(seu@assays$RNA@counts)], name = "Tcell Score")
+  print(FeaturePlot(object = seu, features = "Tcell Score1")+ggtitle(type))
+}
+
+DimPlot(seu, reduction = "umap",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5) + theme(legend.position="bottom")
+
+# 4 Macrophage
+# 0,1,3 fibroblasts
+# 2 endothelial
+
+
+new.cluster.ids <- c('Fibroblasts', 'Fibroblasts', 'Endothelial Cells', 'Fibroblasts','Macrophages')
+names(new.cluster.ids) <- levels(seu)
+seu <- RenameIdents(seu, new.cluster.ids)
+
+```
+
+
+
+
+
+
+
+
+```{r}
+### stats
+stats<-as.data.frame(matrix(data=NA,nrow = 1, ncol = 11))
+colnames(stats)<-c('sample','n_raw_features','n_raw_cells','n_predicted_doublets','n_features','n_cells','median_features','median_counts','cutoff_features','cutoff_counts','cutoff_mt')
+rownames(stats)<-pat
+stats$sample<-pat
+stats$n_raw_features<-dim(seu_raw@assays$RNA@counts)[1]
+stats$n_raw_cells<-dim(seu_raw@assays$RNA@counts)[2]
+stats$n_predicted_doublets <- predicted_doublets
+stats$n_features<-dim(seu@assays$RNA@counts)[1]
+stats$n_cells<-dim(seu@assays$RNA@counts)[2]
+stats$median_features<-round(median(seu@meta.data$nFeature_RNA))
+stats$median_counts<-round(median(seu@meta.data$nCount_RNA))
+stats$cutoff_features<-paste(minFeature,maxFeature)
+stats$cutoff_counts<-paste(minCount,maxCount)
+stats$cutoff_mt<-paste(maxMT)
+
+### Save objects
+saveRDS(seu, file = 'LC191_seu_processed.rds')
+
+### write pdf reports
+pdf(file = "LC191_plots.pdf")
+
+# stats
+textplot(t(stats),cex=1.2,halign='left')
+
+# UMAP
+DimPlot(seu, reduction = "umap",label = T,group.by = 'ident',raster = T,shuffle = T, label.size = 2.5) + theme(legend.position="bottom")
+
+# tumour vs immune
+FeaturePlot(object = seu, features = "immune_score1") + labs(title = "Immune Score", caption = paste("Immune gene signatures present in sample:", valid_immune))
+FeaturePlot(object = seu, features = "tumour_score1") + labs(caption = paste("Tumour gene signatures present in sample:", valid_tumour[1], valid_tumour[2], valid_tumour[3], valid_tumour[4]))
+
+
+# plots raw data
+ggplot(seu_raw@meta.data, aes(x=seu_raw$nCount_RNA,y = seu_raw$nFeature_RNA, col=seu_raw$percent.mt)) + 
+  rasterise(geom_point(size=0.5,alpha=0.5),dpi=300)+ scale_colour_gradient(low="blue", high="green") + 
+  labs(color = "Percent MT") + theme_classic() + ggtitle('Raw object')
+
+ggplot(seu_raw@meta.data, aes(x=seu_raw$nCount_RNA,y = seu_raw$nFeature_RNA)) + 
+  rasterise(geom_point(size=0.5,alpha=0.5),dpi=300)+ scale_colour_gradient(low="lightgrey", high="darkviolet") + 
+  labs(color = "doublet_scores") + theme_classic()+ ggtitle('Raw object')
+
+print(VlnPlot(seu_raw, features = c("nFeature_RNA", "nCount_RNA", "percent.mt",'percent.rps','percent.rpl'),
+              ncol = 3,group.by = 'sample',pt.size = 0))
+
+# QC plot filtered
+ggplot(seu@meta.data, aes(x=seu$nCount_RNA,y = seu$nFeature_RNA, col=seu$percent.mt)) + 
+  rasterise(geom_point(size=0.5,alpha=0.5),dpi=300)+ scale_colour_gradient(low="blue", high="green") + 
+  labs(color = "Percent MT") + theme_classic()+ ggtitle('Filtered object')
+
+ggplot(seu@meta.data, aes(x=seu$nCount_RNA,y = seu$nFeature_RNA)) + 
+  rasterise(geom_point(size=0.5,alpha=0.5),dpi=300)+ scale_colour_gradient(low="lightgrey", high="darkviolet") + 
+  labs(color = "doublet_scores") + theme_classic()+ ggtitle('Filtered object')
+
+print(VlnPlot(seu, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+              ncol = 3,pt.size = 0))
+
+FeaturePlot(seu, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+            min.cutoff = "q05", max.cutoff = 'q95',order=T, raster = T)
+
+# PCA
+print(ElbowPlot(seu))
+DimPlot(seu, reduction = "pca",group.by = 'ident',raster = T,shuffle = T)
+
+
+## singleR
+plotScoreHeatmap(pred_fine, clusters=seu_sce@colData$ident,fontsize = 6,main='pred_bped_fine')
+DimPlot(seu, reduction = "umap",label = T,group.by = 'celltype_fine',repel = T,label.size = 2.5,raster = T,shuffle = T) + 
+  guides(col = guide_legend(nrow = 30,override.aes = list(size=5))) +
+  theme(legend.text=element_text(size=6))
+
+FeatureScatter(seu,feature1 ='nCount_RNA',feature2 = 'nFeature_RNA',shuffle = T,
+               group.by = 'celltype_main',raster = T)
+
+VlnPlot(seu, features = c("nFeature_RNA"),group.by = 'celltype_main',pt.size = 0)
+
+plotScoreHeatmap(pred_main, clusters=seu_sce@colData$ident,fontsize = 6,main='pred_main')
+DimPlot(seu, reduction = "umap",label = T,group.by = 'celltype_main',repel = T,label.size = 2.5,raster = T,shuffle = T) + 
+  guides(col = guide_legend(nrow = 30,override.aes = list(size=5))) +
+  theme(legend.text=element_text(size=6))
+
+dev.off()
+
+
+print(paste('End:',Sys.time()))
+
+
+p <- readRDS("/Users/zackbrodtman/Downloads/LC191_cnv (1).rds")
+
+```

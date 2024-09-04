@@ -1,0 +1,1162 @@
+---
+title: "LKB1 integration"
+output: html_document
+date: "2024-03-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(fields)
+library(KernSmooth)
+library(DoubletFinder)
+library(scCustomize)
+library(openxlsx)
+library(gplots)
+library(metap)
+library(ggplot2)
+library(ggrastr)
+library(DropletUtils)
+library(SingleR)
+library(ROCR)
+library(parallel)
+library(celldex)
+library(SingleCellExperiment)
+library(scater)
+library(pheatmap)
+library(Matrix)
+library(stringi)
+library(Seurat)
+options(future.globals.maxSize = 4000 * 1024^5)
+doublet_rate_df <- data.frame(
+  multiple_rate = c(0.40, 0.80, 1.60, 2.30, 3.10, 3.90, 4.60, 5.40, 6.10, 6.90, 7.60),
+  cells_loaded = c(800, 1600, 3200, 4800, 6400, 8000, 9600, 11200, 12800, 14400, 16000),
+  cells_recovered = c(500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000)
+)
+
+setwd("Documents/jobwork/CUIMC/LKB1/")
+
+#read in sample seurats
+
+seu191 <- readRDS("LC191/seufinal.rds")
+seu20 <- readRDS("LC20/seufinal.rds")
+seu22 <- readRDS("LC22/seufinal.rds")
+seu23 <- readRDS("LC23/seufinal.rds")
+seu23$sample <- 'LC23'
+seu24 <- readRDS("LC24/seufinal.rds")
+seu24$sample <- 'LC24'
+seu25 <- readRDS("LC25/seufinal.rds")
+seu26 <- readRDS("LC26/seufinal.rds")
+seu27 <- readRDS("LC27/seufinal.rds")
+#seu27$orig.ident<-rep('LC27',length(seu27$orig.ident))
+#seu27 <- seu27[,which(seu27$immune != 'immune')]
+
+seu28 <- readRDS("LC28/seufinal.rds")
+seu29 <- readRDS("LC29/seufinal.rds")
+seu30 <- readRDS("LC30/seufinal.rds")
+#seu30$orig.ident<-rep('LC30',length(seu30$orig.ident))
+#seu30 <- seu30[,which(seu30$immune != 'immune')]
+
+seu31 <- readRDS("LC31/seufinal.rds")
+#seu31$orig.ident<-rep('LC31',length(seu31$orig.ident))
+#seu31 <- seu31[,which(seu31$immune != 'immune')]
+
+seu32 <- readRDS("LC32/seufinal.rds")
+seu33 <- readRDS("LC33/seufinal.rds")
+
+# merge samples
+
+seu_merged <-  merge(seu191, y = c(seu20, seu22, seu23, seu24, seu25, seu26, seu27, seu28, seu29, seu30, seu31, seu32, seu33),
+                         add.cell.ids = c("191", "20", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33"))
+
+
+# align celltype names
+
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "B cells" = "B Cells")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "Naive B Cells" = "B Cells")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "Plasma Cells" = "Plasma")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "Unsure" = "Unknown")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "Other" = "Unknown")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "Endothelial Cells" = "Endothelial")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "Other Endothelial Cells" = "Endothelial")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "M2 Macrophage Polarization" = "Macrophages")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "Cycling Endothelial Cells" = "Cycling Endothelial")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "dCAF" = "CAF")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "pCAF" = "CAF")
+seu_merged$major_celltypes <- recode(seu_merged$major_celltypes, "myCAF" = "CAF")
+
+# remove t cell reference cells used for inferCNV which came from previous samples
+
+seu_merged <- seu_merged[,which(seu_merged$immune != 'immune')]
+
+########
+seu_merged$orig.ident <- seu_merged$sample
+table(seu_merged$orig.ident)
+seu_merged.list <- SplitObject(seu_merged, split.by = "orig.ident")
+for (i in 1:length(seu_merged.list)) {
+  print(i)
+  seu_merged.list[[i]] <- NormalizeData(seu_merged.list[[i]],verbose=FALSE)
+  seu_merged.list[[i]] <- FindVariableFeatures(seu_merged.list[[i]], verbose=FALSE)
+}
+# select features that are repeatedly variable across datasets for integration run PCA on each
+# dataset using these features
+features <- SelectIntegrationFeatures(object.list = seu_merged.list)
+seu_merged.list <- lapply(X = seu_merged.list, FUN = function(x) {
+  x <- ScaleData(x, features = features, verbose = FALSE)
+  x <- RunPCA(x, features = features, verbose = FALSE)
+})
+
+LKB1.anchors <- readRDS("LKB1.anchors")
+# Find integration anchors
+LKB1.anchors <- FindIntegrationAnchors(object.list = seu_merged.list,  reduction = "cca",dims = 1:30)
+LKB1_integrated <- IntegrateData(anchorset = LKB1.anchors,dims=1:30)
+saveRDS(LKB1.anchors, "LKB1.anchors.rds")
+saveRDS(LKB1_integrated, "LKB1_integrated.rds")
+
+obj <- readRDS("LKB1_integrated.rds")
+# normalize
+
+#obj <- NormalizeData(LKB1_integrated)
+#obj <- FindVariableFeatures(obj)
+obj <- ScaleData(obj)
+obj <- RunPCA(obj)
+ElbowPlot(obj, ndims = 50)
+
+
+# unsupervised clustering & umap
+
+obj <- RunUMAP(obj, reduction = "pca", dims = 1:30)
+obj <- FindNeighbors(obj, reduction = "pca", dims = 1:30)
+obj <- FindClusters(obj, resolution = 0.5, cluster.name = "cca_clusters")
+
+
+
+q75 <- quantile(obj$cnv_avg, probs = 0.75)
+obj$malignant<-ifelse(obj$malignant == 'malignant', TRUE,FALSE)
+obj$cancer<-ifelse(obj$cnv_avg > q75 , TRUE,FALSE)
+
+### write pdf reports
+pdf(file = "integrationplots.pdf")
+
+DimPlot(
+  obj,
+  reduction = "umap",
+  group.by = c("sample", "major_celltypes"),
+  combine = FALSE, label.size = 2
+)
+
+DimPlot(
+  obj,
+  reduction = "pca",
+  group.by = c("sample", "major_celltypes"),
+  combine = FALSE, label.size = 2
+)
+
+ggplot(obj@meta.data, aes(x=cca_clusters, fill=sample)) + geom_bar(position = "fill") + ggtitle('Sample mixing after CCA integration')
+
+
+FeaturePlot(obj, features = 'proportion_cnv_avg')
+FeaturePlot(obj, features = 'malignant') + ggtitle('Malignant assignments by inferCNV (per sample)') +labs(caption = "cnv score above q75 of individual samples")
+FeaturePlot(obj, features = 'malignant', reduction ="pca") + ggtitle('Malignant assignments by inferCNV (per sample)') +labs(caption = "cnv score above q75 of individual samples")
+FeaturePlot(obj, features = 'cancer') + ggtitle('Malignant assignments by inferCNV (integrated results)') +labs(caption = "cnv score above q75 of integrated object")
+FeaturePlot(obj, features = 'cancer', reduction = "pca") + ggtitle('Malignant assignments by inferCNV (integrated results)') +labs(caption = "cnv score above q75 of integrated object")
+
+DimPlot(obj, label = T)
+
+dev.off()
+```
+
+```{r}
+median_cnv <- tapply(obj.joined@meta.data$cnv_avg, obj.joined@meta.data$cca_clusters, median)
+
+# Order clusters based on median cnv_avg
+ordered_clusters <- names(sort(median_cnv, decreasing = TRUE))
+
+# Convert cca_clusters to factor with ordered levels
+obj.joined@meta.data$cca_clusters <- factor(obj.joined@meta.data$cca_clusters, levels = ordered_clusters)
+
+pdf(file= "cnv_box_plot.pdf")
+# Create the box plot
+ggplot(obj.joined@meta.data, aes(x = cca_clusters, y = cnv_avg)) +
+  geom_boxplot(outlier.size = 0.5) +
+  labs(x = "Cluster Number", y = "CNV Average") +
+  ggtitle("CNV Average Across Clusters") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+DimPlot(obj, label = T)
+
+dev.off()
+
+malignant_clusters <- c(0, 2, 6, 9, 10, 4, 13, 8, 1)
+DefaultAssay(obj) <- 'RNA'
+obj.joined <- JoinLayers(obj)
+# Create the new column 'malignant_v1' in the metadata
+obj.joined@meta.data$malignant_v1 <- ifelse(obj@meta.data$cca_clusters %in% malignant_clusters, TRUE, FALSE)
+custom_palette <- c("FALSE" = "lightgreen", "TRUE" = "red")
+my_cols <- c('Malignant'='#F68282','T Cell'='#31C53F','Fibroblast'='#1FA195','Endothelial'='#B95FBB','Myeloid'='#D4D915',
+  'Other'='#ff9a36','Pericytes'='#faf4cf')
+
+my_cols2 <- my_cols[order(as.integer(names(my_cols)))]
+
+
+
+DimPlot(obj.joined, reduction ="umap" ) +ggtitle("Unsupervised Clustering")
+DimPlot(obj.joined, reduction ="pca" ) +ggtitle("Unsupervised Clustering")
+FeaturePlot(obj.joined, features = 'malignant_v1', col = custom_palette, reduction ="umap" ) +ggtitle("Malignant Assignment")
+FeaturePlot(obj.joined, features = 'malignant_v1', col = custom_palette, reduction ="pca" ) +ggtitle("Malignant Assignment")
+DimPlot(obj.joined, group.by = 'celltypes', label = T, label.size = 3.2, cols = my_cols2) + ggtitle("Celltype Assignment")
+DimPlot(obj.joined, group.by = 'celltypes', reduction = "pca", label.size = 3, cols = my_cols2) + ggtitle("Celltype Assignment")
+
+```
+
+
+```{r}
+
+#separate malignant and nonmalignant
+malignant_obj <- subset(obj.joined, subset = malignant_v1==TRUE)
+nonmalignant_obj <- subset(obj.joined, subset = malignant_v1==FALSE)
+#nonmalignant_obj <- obj.joined[,which(obj.joined$malignant_v1 == FALSE)]
+#malignant_obj <- obj.joined[,which(obj.joined$malignant_v1 == TRUE)]
+
+
+nonmalignant_obj <- NormalizeData(nonmalignant_obj)
+nonmalignant_obj <- FindVariableFeatures(nonmalignant_obj)
+nonmalignant_obj <- ScaleData(nonmalignant_obj)
+nonmalignant_obj <- RunPCA(nonmalignant_obj)
+ElbowPlot(seu, ndims = 50)
+
+sweep.list <- paramSweep(nonmalignant_obj, PCs = 1:30)
+sweep.stats <- summarizeSweep(sweep.list)
+
+bcmvn <- find.pK(sweep.stats)
+
+pK <- bcmvn %>% 
+  dplyr::filter(BCmetric == max(BCmetric)) %>%
+  dplyr::select(pK) 
+pK <- as.numeric(as.character(pK[[1]]))
+
+nonmalignant_obj <- FindNeighbors(nonmalignant_obj, dims = 1:30)
+nonmalignant_obj <- FindClusters(nonmalignant_obj, resolution = 0.5)
+
+## Homotypic doublet proportion estimate
+doublet_rate <- doublet_rate_df$multiple_rate[which.min(abs(doublet_rate_df$cells_recovered - dim(nonmalignant_obj@assays$RNA)[2]))]*0.01
+annotations <- nonmalignant_obj@meta.data$seurat_clusters
+homotypic.prop <- modelHomotypic(annotations) 
+nExp.poi <- round(doublet_rate * nrow(nonmalignant_obj@meta.data)) 
+nExp.poi.adj <- round(nExp.poi * (1 - homotypic.prop))
+
+# Run doubletFinder
+nonmalignant_obj <- doubletFinder(nonmalignant_obj, PCs = 1:30, pN = 0.25, pK = pK, nExp = nExp.poi.adj, reuse.pANN = FALSE)
+
+metadata <- nonmalignant_obj@meta.data
+colnames(metadata)[892] <- "doublet_finder"
+nonmalignant_obj@meta.data <- metadata 
+
+nonmalignant_obj <- RunUMAP(nonmalignant_obj, dims = 1:30)
+DimPlot(nonmalignant_obj, reduction = 'umap', group.by = "doublet_finder")
+
+# number of singlets and doublets
+table(nonmalignant_obj@meta.data$doublet_finder)
+predicted_doublets <- table(nonmalignant_obj@meta.data$doublet_finder)['Doublet']
+
+# subset and save
+data.singlets <- subset(nonmalignant_obj, doublet_finder == "Singlet")
+nonmalignant_obj <- data.singlets
+remove(data.singlets)
+```
+
+
+
+```{r}
+
+malignant_obj <- NormalizeData(malignant_obj)
+malignant_obj <- FindVariableFeatures(malignant_obj)
+malignant_obj <- ScaleData(malignant_obj)
+malignant_obj <- RunPCA(malignant_obj)
+ElbowPlot(malignant_obj, ndims = 50)
+
+#nonmalignant_obj <- RunUMAP(nonmalignant_obj, dims = 1:30)
+malignant_obj <- RunUMAP(malignant_obj, dims = 1:30)
+
+malignant_obj <- FindNeighbors(malignant_obj, dims = 1:30)
+malignant_obj <- FindClusters(malignant_obj, resolution = 0.5)
+
+
+Genes_t_cells <- toupper(c('Bcl11b',   'Fyn',   'Ikzf1',   'Ccl5',   'Lyst',  'Cd247',   'Cblb', 'Iqgap2',  'Ets1', 'Skap1',  'Elmo1',  'Itga4', 'Dtdh1','aoah',
+                   'Ptprc',  'Cd44',  'Pyhin1',  'Cd8a',  'Cd96', 'Ifi6',  'Nfat5',  'Themis', 'Prkch',  'Itk',  'Pde3b',  'Bach2','Nck2',  'Celf2',
+                   'Itga1', 'Rbpj',  'Tnik',   'Lef1',   'Ripor2', 'Akt3', 'Rora', 'Foxp1',  'Ncam1',   'Klrc1',   'Klrc2','klrd1',  'Lyn',  'Ncr1',
+                   'Klrk1',   'Actb',  'B2m', 'Stat4',   'Runx2',   'Itga4','itga1','cd69', 'Itgae',   'Cd44', 'Cd58','il2ra',
+                   'Tbc1d4',  'Ctla4','icos', 'Cd4'))
+Genes_myeloid <-  toupper(c('Clec9a','Ccr1',  'Clnk', 'Slc38a1','Rtn1','Sirpa','Ido1','lamp3','Cd200','Ms4a2','Kit','Mrc1','Mertk','Fcgr1a','Cd38','Cd163l1',
+                   'Selenop','F13a1','Dab2','Diglec1','ftl','fth1','Nav3','c3','P2ry12','Vcan','Fcn1','lyz'))
+Genes_endothelial <-  toupper(c('vegfc', 'Dll4' ,'Efnb2' ,'Rgcc', 'Kiaa1217', 'Arhgap18', 'Mmrn1', 'Flt4', 'Sema3d','reln', 'Nr2f2', 'Cdh11', 'Mki67' ))
+Genes_fibroblasts <-  toupper(c('rgs5', 'Cspg4', 'Abcc9', 'Pdgfra', 'Lum', 'Dcn', 'Cthrc1', 'Col1a1' ,'Col3a1', 'Col6a1' ,'Lama2' ))
+Genes_bcells <-  toupper(c('Bank1','Blk','Mki67','Top2a','Sdc1','Cd38','Prdm1' ))
+Genes_neuronal <-  toupper(c('Gfap', 'Aqp4', 'Slc1a2', 'Gja1', 'Reln', 'Nrgn', 'Stx1a', 'Nefh', 'Syp', 'Snrpn', 'Satb2', 'Slc17a7', 'Gad1', 'Gad2', 'Slc32a1',
+                    'Slc6a1', 'Mag', 'Mog', 'Mbp', 'Mobp', 'Vcan', 'Cspg4', 'Sox10', 'Olig1' ))
+
+
+nonmalignant_obj <- AddModuleScore(object = nonmalignant_obj, features = Genes_t_cells[Genes_t_cells %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "integrated_t")
+nonmalignant_obj <- AddModuleScore(object = nonmalignant_obj, features = Genes_myeloid[Genes_myeloid %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "integrated_myeloid")
+nonmalignant_obj <- AddModuleScore(object = nonmalignant_obj, features = Genes_endothelial[Genes_endothelial %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "integrated_endothelial")
+nonmalignant_obj <- AddModuleScore(object = nonmalignant_obj, features = Genes_fibroblasts[Genes_fibroblasts %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "integrated_fibroblast")
+nonmalignant_obj <- AddModuleScore(object = nonmalignant_obj, features = Genes_bcells[Genes_bcells %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "integrated_b")
+nonmalignant_obj <- AddModuleScore(object = nonmalignant_obj, features = Genes_neuronal[Genes_neuronal %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "integrated_neuronal")
+
+pdf('markerplots.pdf')
+FeaturePlot(object = nonmalignant_obj, features = "integrated_t1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_myeloid1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_endothelial1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_fibroblast1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_b1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_neuronal1")
+dev.off()
+
+DimPlot(nonmalignant_obj, label = T)
+DimPlot(nonmalignant_obj, group.by = 'sample')
+
+```
+
+```{r}
+generateCellTypeLists <- function(signature_file_path, celltype, seurat_object) {
+# Load the Excel file with specific cell types and associated genes
+cell_signatures_xl <- read.xlsx(signature_file_path, detectDates = FALSE)
+
+# Initialize an empty list to store gene sets for specific cell types
+signature_list <- list()
+
+# Iterate through the columns (specific cell types) in the Excel file
+for (i in 1:ncol(cell_signatures_xl)) {
+  cell_type <- colnames(cell_signatures_xl)[i]
+  genes <- cell_signatures_xl[, i]
+  
+  # Filter out empty gene names (if any)
+  genes <- genes[!is.na(genes) & genes != ""]
+  
+  # Store the genes associated with the specific cell type in the list
+  signature_list[[cell_type]] <- genes
+}
+
+
+return(
+signature_list[[celltype]])
+}
+
+
+# 8 b cells/cycling endothelial
+# 6 1 14 19 13 17 fibroblasts
+# 4 fibroblast/endothelial
+# 2 3 7 11 10 12 t/cycling endothelial
+#  5  myeloid
+# 0 myeloid/cycling endothelial
+# 9 myeloid/cycling b/cycling endothelial
+
+new.cluster.ids <- c('Myeloid', "Fibroblast", "T Cell", "T Cell", "Endothelial", "Myeloid", "Pericytes", "T Cell", "B Cell", "Myeloid", "Other", "T Cell", "T Cell", "Other", "Fibroblast", "Other", "Myeloid", "Other", "Other", "Fibroblast")
+names(new.cluster.ids) <- levels(nonmalignant_obj)
+nonmalignant_obj <- RenameIdents(nonmalignant_obj, new.cluster.ids)
+nonmalignant_obj$celltypes <- Idents(nonmalignant_obj)
+DimPlot(nonmalignant_obj, label =T)
+
+
+
+
+```
+
+```{r}
+
+# Find markers for clusters
+for (i in 0:19) {
+  cluster_markers <- FindMarkers(nonmalignant_obj, ident.1 = i, ident.2 = NULL, only.pos = TRUE)
+  assign(paste0("de.markers.", i), cluster_markers)
+}
+
+library(openxlsx)
+
+# Define the file name for the Excel file
+excel_file <- "marker_genes.xlsx"
+
+# Create a new Excel workbook
+wb <- createWorkbook()
+
+# Loop through each cluster marker gene dataframe
+for (i in 1:20) {
+  # Get the dataframe for the current cluster
+  cluster_markers <- get(paste0("de.markers.", i-1))
+  
+  # Filter the top 150 statistically significant marker genes
+  top_genes <- cluster_markers[order(cluster_markers$avg_log2FC, decreasing = TRUE), ]
+  top_genes <- top_genes[top_genes$p_val_adj < 0.01, ]
+  top_genes <- head(top_genes, 150)
+  top_genes$Gene <- rownames(top_genes)
+  top_genes <- top_genes[, c("Gene", "p_val", "avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+  
+  # Add the dataframe to a new sheet in the Excel workbook
+  addWorksheet(wb, sheetName = paste0("Cluster_", i-1))
+  writeData(wb, sheet = i, top_genes)
+}
+
+# Save the Excel workbook
+saveWorkbook(wb, file = excel_file)
+
+
+```
+
+```{r}
+
+
+
+
+
+# Define the list of score names
+score_names <- c("integrated_t1", "integrated_myeloid1", "integrated_b1", "integrated_fibroblast1", "integrated_neuronal1", "integrated_endothelial1")
+
+# Create an empty list to store the median values for each score
+median_scores <- list()
+
+# Calculate median score for each cluster for each score
+for (score_name in score_names) {
+  median_scores[[score_name]] <- tapply(nonmalignant_obj@meta.data[[score_name]], nonmalignant_obj@meta.data$seurat_clusters, median)
+}
+
+# Create a list to store ggplot objects
+plots <- list()
+
+# Create a box plot for each score
+for (score_name in score_names) {
+  
+  #Order clusters based on median scores
+  ordered_clusters <- names(sort(median_scores[[score_name]], decreasing = TRUE))
+  # Convert cca_clusters to factor with ordered levels
+  nonmalignant_obj@meta.data$seurat_clusters <- factor(nonmalignant_obj@meta.data$seurat_clusters, levels = ordered_clusters)
+
+  # Create the box plot
+  p <- ggplot(nonmalignant_obj@meta.data, aes(x = seurat_clusters, y = .data[[score_name]])) +
+    geom_boxplot(outlier.size = 0.5) +
+    labs(x = "Cluster", y = score_name) +
+    ggtitle(paste(score_name, "Across Clusters")) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+  
+  # Append the plot to the list of plots
+  plots[[score_name]] <- p
+}
+
+# Arrange the plots side by side
+library(gridExtra)
+
+
+pdf("celltype_nonmalignant.pdf")
+
+FeaturePlot(obj.joined, features = 'malignant_v1', col = custom_palette)
+DimPlot(nonmalignant_obj, group.by = 'celltypes', label = T)+ theme(legend.position = "none")
+grid.arrange(grobs = plots[1:2], ncol = 1)
+grid.arrange(grobs = plots[3:4], ncol = 1)
+grid.arrange(grobs = plots[5:6], ncol = 1)
+FeaturePlot(object = nonmalignant_obj, features = "integrated_t1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_myeloid1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_endothelial1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_fibroblast1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_b1")
+FeaturePlot(object = nonmalignant_obj, features = "integrated_neuronal1")
+
+b_cell_types <- c("Activated.B.cells",
+                  "Cycling.B.cells",	"Stromal.cells",	"Follicular.B.cells",
+                  "Memory.B.cells",	"Naive.B.cells")
+
+for (type in b_cell_types){
+  gene_list <- generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/bcells.signature.mouse.xlsx', celltype=type, seurat_object = nonmalignant_obj)
+  nonmalignant_obj <-  AddModuleScore(object = nonmalignant_obj, features = gene_list[gene_list %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "B Cell Score")
+  print(FeaturePlot(object = nonmalignant_obj, features = "B Cell Score1")+ggtitle(type))
+}
+
+
+### cardiomyocytes
+
+cardiomyocyte_types <- c("Ventricular.Cardiomyocyte")
+
+for (type in cardiomyocyte_types){
+  gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/cardiomyocytes.signature.mouse.xlsx', celltype=type, seurat_object = nonmalignant_obj))
+  nonmalignant_obj <-  AddModuleScore(object = nonmalignant_obj, features = gene_list[gene_list %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "Cardiomyocyte Score")
+  print(FeaturePlot(object = nonmalignant_obj, features = "Cardiomyocyte Score1")+ggtitle(type))
+}
+
+### endothelial
+
+endothelial_types <- c("Other.Endothelial",	"Lymphatic.ECs", "Arterial.ECs",
+                       "Cycling.ECs")
+
+for (type in endothelial_types){
+  gene_list <- generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/endothelial.signature.mouse.xlsx', celltype=type, seurat_object = nonmalignant_obj)
+  nonmalignant_obj <-  AddModuleScore(object = nonmalignant_obj, features = gene_list[gene_list %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "Endothelial Score")
+  print(FeaturePlot(object = nonmalignant_obj, features = "Endothelial Score1")+ggtitle(type))
+}
+
+### fibroblasts
+fibroblast_types <- c("Perivascular.Fibroblasts",	"CAFs", "Ependymal.Cells",	
+                      "myCAF",	"dCAF",
+                    	"pCAF", "Intermediate.pathological.FB",
+                      "Adventitial.FB",	"Alveolar.FB",	
+                      "Pathological.FB", "Other.FB", "Airway.smooth.muscle",	"Pericyte",	"Vascular.smooth.muscle",
+                      "Mesothelial.FB")
+
+for (type in fibroblast_types){
+  gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/fibroblasts.signature.mouse.xlsx', celltype=type, seurat_object = nonmalignant_obj))
+  nonmalignant_obj <-  AddModuleScore(object = nonmalignant_obj, features = gene_list[gene_list %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "Fibroblast Score")
+  print(FeaturePlot(object = nonmalignant_obj, features = "Fibroblast Score1")+ggtitle(type))
+}
+
+### myeloid
+myeloid_types <- c("MacrophagesM1", 'MacrophagesM2',
+  "M1_Macrophage_Polarization",	"M2_Macrophage_Polarization", "Mono_CD16", "Mono_CD16_C1qa"
+  )
+
+for (type in myeloid_types){
+  gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/myeloid.bakhoum.mouse.xlsx', celltype=type, seurat_object = nonmalignant_obj))
+  nonmalignant_obj <-  AddModuleScore(object = nonmalignant_obj, features = gene_list[gene_list %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "Myeloid Score")
+  print(FeaturePlot(object = nonmalignant_obj, features = "Myeloid Score1")+ggtitle(type))
+}
+
+### T cells
+Tcell_types <- c("Tfh",	"CD8_NaiveLike",	"CD8_EffectorMemory",	"CD8_EarlyActiv",	"Th1",	"CD4_NaiveLike",	"CD8_Tpex",	"CD8_Tex")
+
+for (type in Tcell_types){
+  gene_list <- toupper(generateCellTypeLists(signature_file_path = '/Users/zackbrodtman/Documents/jobwork/CUIMC/JG02/LC/TIL_tcell_signature_mouse.xlsx', celltype=type, seurat_object = nonmalignant_obj))
+  nonmalignant_obj <-  AddModuleScore(object = nonmalignant_obj, features = gene_list[gene_list %in% rownames(nonmalignant_obj@assays$RNA$counts)], name = "Tcell Score")
+  print(FeaturePlot(object = nonmalignant_obj, features = "Tcell Score1")+ggtitle(type))
+}
+
+#DimPlot(nonmalignant_obj, label = T) + theme(legend.position="bottom")
+
+
+dev.off()
+
+
+```
+
+
+```{r}
+
+pdf("integration_summary.pdf")
+
+FeaturePlot(obj.joined, features = 'malignant_v1', col = custom_palette ) + ggtitle("Tentative Malignant Assignment") +theme(legend.position = "none")
+DimPlot(nonmalignant_obj, group.by = 'celltypes', label = T, label.size = 3, pt.size = 0.001)+ theme(legend.position = "bottom") + ggtitle("Nonmalignant Celltyping")
+ggplot(obj@meta.data, aes(x=cca_clusters, fill=sample)) + geom_bar(position = "fill") + ggtitle('Sample mixing after CCA integration')
+dev.off()
+
+
+
+```
+```{r}
+
+# Create a new column 'celltypes' in obj@meta.data and initialize with 'malignant'
+obj.joined@meta.data$celltypes <- "Malignant"
+
+# Identify the common cell names between the two dataframes
+common_cells <- intersect(rownames(nonmalignant_obj@meta.data), rownames(obj.joined@meta.data))
+
+# Update the celltypes for common cells
+obj.joined@meta.data[c(common_cells), 'celltypes'] <- as.character(nonmalignant_obj@meta.data[c(common_cells), 'celltypes'])
+
+
+DimPlot(obj.joined, group.by = 'celltypes', label = T, label.size = 3)
+saveRDS(obj.joined, 'integration_with_celltypes.rds')
+saveRDS(malignant_obj, 'malignant_seu.rds')
+saveRDS(nonmalignant_obj, 'nonmalignant_seu.rds')
+
+
+```
+
+### convert to anndata
+
+```{r}
+a <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/integration_with_celltypes.rds")
+
+table(a$celltypes)
+group_mapping <- c("LC191" = "KL-MSA",
+                   "LC20" = "KL-MSA",
+                   "LC22" = "KL-DMSO",
+                   "LC23" = "KL-CGASKO-DMSO",
+                   "LC24" = "KL-DMSO",
+                   "LC25" = "KL-CGASKO-MSA",
+                   "LC26" = "KL-CGASKO-MSA",
+                   "LC27" = "KL-CGASKO-DMSO",
+                   "LC28" = "KL-CGASKO-DMSO",
+                   "LC29" = "KL-DMSO",
+                   "LC30" = "KL-CGASKO-MSA",
+                   "LC31" = "KL-MSA",
+                   "LC32" = "KL-MSA",
+                   "LC33" = "KL-MSA")
+
+# Add group information to ID_major column
+a@meta.data$condition <- group_mapping[a@meta.data$orig.ident] 
+a@meta.data$'cell type' <- a@meta.data$celltypes
+
+columns_to_keep <- c("cell type", "sample", "condition")
+a@meta.data <-a@meta.data[, columns_to_keep]
+DefaultAssay(a) <- "integrated"
+
+sce_obj <- as.SingleCellExperiment(a, assay = c("integrated"))
+writeH5AD(sce_obj, "/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/sce_obj.h5ad", X_name = 'counts')
+
+
+
+#a <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/immune_subclustering/Tcells.rds")
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/bakhoum/umap_all.pdf")
+DimPlot(a, group.by = 'celltypes') +ggtitle('Celltypes')#, cols = c("purple", "violet", "orange", "red", "royalblue", "green", "brown", "darkgreen"))
+dev.off()
+
+
+```
+
+
+
+### Volcano plot and GSEA on cancer cells
+
+```{r}
+m <- add_metadata(malig)
+levels(m)
+m <- a
+
+
+Idents(m) <- m$condition
+
+# Extract the top markers for each cell type
+
+m <- subset(m, celltypes == "Malignant")
+kl_msa2 <- subset(m, idents = c("KL-MSA", "KL-CGASKO-MSA"))
+kl_dmso <- subset(m, idents = c("KL-DMSO", "KL-CGASKO-DMSO"))
+kl_msa_dmso <- subset(m, idents = c("KL-CGASKO-DMSO", "KL-CGASKO-MSA"))
+kl_msa_kl_dmso <- subset(m, idents = c("KL-DMSO", "KL-MSA"))
+
+deg_kl_msa2 <- FindMarkers(kl_msa2, ident.1 = "KL-MSA", ident.2 = "KL-CGASKO-MSA", 
+                           only.pos = FALSE, min.pct = 0.25, logfc.threshold = 0.25)
+deg_kl_dmso <- FindMarkers(kl_dmso, ident.1 = "KL-DMSO", ident.2 = "KL-CGASKO-DMSO", 
+                           only.pos = FALSE, min.pct = 0.25, logfc.threshold = 0.25)
+deg_kl_msa_dmso <- FindMarkers(kl_msa_dmso, ident.1 = "KL-CGASKO-DMSO", ident.2 = "KL-CGASKO-MSA", 
+                           only.pos = FALSE, min.pct = 0.25, logfc.threshold = 0.25)
+deg_kl_msa_kl_dmso <- FindMarkers(kl_msa_kl_dmso, ident.1 = "KL-DMSO", ident.2 = "KL-MSA", 
+                           only.pos = FALSE, min.pct = 0.25, logfc.threshold = 0.25)
+
+replace_zero_pvals <- function(deg_results) {
+  deg_results$p_val_adj[deg_results$p_val_adj == 0] <- 1e-300
+  return(deg_results)
+}
+
+# Replace 0 p-values for each DEG result
+deg_kl_msa2 <- replace_zero_pvals(deg_kl_msa2)
+deg_kl_dmso <- replace_zero_pvals(deg_kl_dmso)
+deg_kl_msa_dmso <- replace_zero_pvals(deg_kl_msa_dmso)
+deg_kl_msa_kl_dmso <- replace_zero_pvals(deg_kl_msa_kl_dmso)
+
+
+get_top_genes_by_log2fc <- function(deg_results, n = 250) {
+  deg_results %>%
+    arrange(desc(abs(avg_log2FC))) %>%
+    slice_head(n = n)
+}
+
+deg_kl_msa2_50 <- get_top_genes_by_log2fc(deg_kl_msa2)
+deg_kl_dmso_50 <- get_top_genes_by_log2fc(deg_kl_dmso)
+deg_kl_msa_dmso_50 <- get_top_genes_by_log2fc(deg_kl_msa_dmso)
+deg_kl_msa_kl_dmso_50 <- get_top_genes_by_log2fc(deg_kl_msa_kl_dmso)
+
+library(EnhancedVolcano)
+pdf("~/Downloads/volcano.pdf", height = 10, width = 12)
+keyvals <- ifelse(
+    deg_kl_msa2_50$avg_log2FC < -1, 'royalblue',
+      ifelse(deg_kl_msa2_50$avg_log2FC > 1, 'red',
+        'grey'))
+  keyvals[is.na(keyvals)] <- 'grey'
+  names(keyvals)[keyvals == 'red'] <- 'Enrichment in KL-MSA'
+  names(keyvals)[keyvals == 'grey'] <- ''
+  names(keyvals)[keyvals == 'royalblue'] <- 'Enrichment in KL-CGASKO-MSA'
+  
+EnhancedVolcano(deg_kl_msa2_50,
+    lab = rownames(deg_kl_msa2_50),
+    x = 'avg_log2FC', colCustom = keyvals,
+    y = 'p_val_adj', drawConnectors = TRUE, lengthConnectors = unit(0.001, 'npc'),
+    selectLab = c('ADD2', 'GBP2', 'RBFOX1', 'ANO6', 'ENPP2', 'IIGP1', 'DNM3', 'IKZF3', 'CD55', 'IL33'),
+    title = 'KL-MSA versus KL-CGASKO-MSA', subtitle = "Positive L2FC indicates enrichment in KL-MSA")
+
+keyvals <- ifelse(
+    deg_kl_dmso_50$avg_log2FC < -1, 'royalblue',
+      ifelse(deg_kl_dmso_50$avg_log2FC > 1, 'red',
+        'grey'))
+  keyvals[is.na(keyvals)] <- 'grey'
+  names(keyvals)[keyvals == 'red'] <- 'Enrichment in KL-DMSO'
+  names(keyvals)[keyvals == 'grey'] <- ''
+  names(keyvals)[keyvals == 'royalblue'] <- 'Enrichment in KL-CGASKO-DMSO'
+  
+EnhancedVolcano(deg_kl_dmso_50,
+    lab = rownames(deg_kl_dmso_50),
+    x = 'avg_log2FC', colCustom = keyvals,
+    y = 'p_val_adj', drawConnectors = TRUE, lengthConnectors = unit(0.001, 'npc'),
+    selectLab = c("CD55", "CTLA2A", "SNED1", "WNT5a", "GBP4", "IIGP1", "ADD2", "STAT1"),
+    title = 'KL-DMSO versus KL-CGASKO-DMSO', subtitle = "Positive L2FC indicates enrichment in KL-DMSO")
+
+keyvals <- ifelse(
+    deg_kl_msa_dmso_50$avg_log2FC < -1, 'royalblue',
+      ifelse(deg_kl_msa_dmso_50$avg_log2FC > 1, 'red',
+        'grey'))
+  keyvals[is.na(keyvals)] <- 'grey'
+  names(keyvals)[keyvals == 'red'] <- 'Enrichment in KL-CGASKO-DMSO'
+  names(keyvals)[keyvals == 'grey'] <- ''
+  names(keyvals)[keyvals == 'royalblue'] <- 'Enrichment in KL-CGASKO-MSA'
+  
+EnhancedVolcano(deg_kl_msa_dmso_50,
+    lab = rownames(deg_kl_msa_dmso_50),
+    x = 'avg_log2FC', colCustom = keyvals,
+    y = 'p_val_adj', drawConnectors = TRUE, lengthConnectors = unit(0.001, 'npc'),
+    selectLab = c("RBFOXO1","LRRC4","CHL1","GBP4","GBP8"),
+    title = 'KL-CGASKO-DMSO versus KL-CGASKO-MSA', subtitle = "Positive L2FC indicates enrichment in KL-CGASKO-DMSO")
+
+dev.off()
+
+
+deg_kl_msa2_50$gene <- rownames(deg_kl_msa2_50)
+deg_kl_dmso_50$gene <- rownames(deg_kl_dmso_50)
+deg_kl_msa_dmso_50$gene <- rownames(deg_kl_msa_dmso_50)
+deg_kl_msa_kl_dmso_50$gene <- rownames(deg_kl_msa_kl_dmso_50)
+
+
+write.csv(deg_kl_msa2_50, "/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/DEGs_MSA_CGASKO_MSA.csv")
+write.csv(deg_kl_dmso_50, "/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/DEGs_DMSO_CGASKO_DMSO.csv")
+write.csv(deg_kl_msa_dmso_50, "/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/DEGs_CGASKO_DMSO_CGASKO_MSA.csv")
+write.csv(deg_kl_msa_kl_dmso_50, "/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/DEGs_DMSO_MSA.csv")
+
+cgasko_dmso_cgasko_msa <- read.csv("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/DEGs_CGASKO_DMSO_CGASKO_MSA.csv")
+dmso_msa <- read.csv("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/DEGs_DMSO_MSA.csv")
+
+
+
+
+library(enrichR)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(readxl)
+library(clusterProfiler)
+library(enrichplot)
+listEnrichrSites()
+setEnrichrSite("Enrichr") # Human genes
+websiteLive <- TRUE
+dbs <- listEnrichrDbs()
+if (is.null(dbs)) websiteLive <- FALSE
+if (websiteLive) head(dbs)
+
+dbs <- c("MSigDB_Hallmark_2020","GO_Biological_Process_2021")
+
+group2_genes <- list(
+  KL_CGASKO_DMSO = unique(cgasko_dmso_cgasko_msa[cgasko_dmso_cgasko_msa$avg_log2FC>0,]$gene),
+  KL_CGASKO_MSA = unique(cgasko_dmso_cgasko_msa[cgasko_dmso_cgasko_msa$avg_log2FC<0,]$gene))
+
+
+
+names <- list()
+names[1] <- 'KL-CGASKO-DMSO DEGs'
+names[2] <- 'KL-CGASKO-MSA DEGs'
+
+enrichments <- data.frame()
+for (i in 1:2){
+  top <- group2_genes[[i]]
+  if (websiteLive) {
+    enriched <- enrichr(top, dbs)
+  }
+  enrichment <- rbind(enriched[1]$MSigDB_Hallmark_2020, enriched[2]$GO_Biological_Process_2021)
+  enrichment <- enrichment[order(enrichment$Adjusted.P.value, decreasing = FALSE), ]
+  enrichment$Term <- gsub("\\s*\\(.*", "", enrichment$Term)
+  enrichment$Count <- str_count(enrichment$Genes, ";") + 1
+  
+  h_mut_enr<-head(enrichment, 20)
+  h_mut_enr$GeneRatio <- c(sapply(h_mut_enr$Overlap, function(x) eval(parse(text=x))))
+  
+  enrichment$GeneRatio <- c(sapply(enrichment$Overlap, function(x) eval(parse(text=x))))
+
+  if ((i == 1)){
+    enrichment$Condition <- 'KL-CGASKO-DMSO'
+  }
+  if ((i == 2)){
+    enrichment$Condition <- 'KL-CGASKO-MSA'
+  }
+  
+  if ((i == 1)){
+    h_mut_enr$Condition <- 'KL-CGASKO-DMSO'
+  }
+  if ((i == 2)){
+    h_mut_enr$Condition <- 'KL-CGASKO-MSA'
+  }
+  
+  enrichments <- rbind(enrichments, enrichment)
+  #cairo_pdf(paste0(gsub(" ", "_", gsub("/", "_", names[[i]])), ".pdf"), width = 18, height = 10)
+  print(ggplot(h_mut_enr, aes(x = GeneRatio, y = factor(Term, levels = rev(h_mut_enr$Term)))) + 
+  geom_point(aes(size = Count, color = Adjusted.P.value)) +
+  scale_size_continuous(range = c(1, 10)) + # Adjust the range of dot sizes as needed
+  #scale_color_manual(name = "Adjusted P Value", values = c("red", "blue"), labels = c("≤0.05", ">0.05")) +
+  theme_bw(base_size = 14) +scale_color_gradient(low = "red", high = "blue") + 
+  ylab(NULL) +
+  ggtitle(paste0("Hallmark Pathway Enrichment for ",names[[i]])))
+  #dev.off()
+
+}
+
+
+write.csv(enrichments, "~/Downloads/msa_cgasko_msa_enrichments.csv")
+
+
+
+
+
+# Filter the dataframe
+#filtered_enrichments <- enrichments#[grep('interfer', enrichments$Term),] #enrichments %>%
+#  filter(Term %in% terms_to_filter)
+
+filtered_enrichments <- h_mut_enr
+
+
+filtered_enrichments1 <- filtered_enrichments %>%
+  mutate(
+    Combined.Score = ifelse(Condition == "KL-CGASKO-MSA", -Combined.Score, Combined.Score),
+    Color = ifelse(Condition == "KL-CGASKO-DMSO", "#65011f", "#053061")
+  )
+epsilon <- 1e-10
+log_transformed <- log(filtered_enrichments1$Adjusted.P.value + epsilon)
+
+# Step 2: Normalize the log-transformed values to range [0, 1]
+log_min <- min(log_transformed)
+log_max <- max(log_transformed)
+normalized <- (log_transformed - log_min) / (log_max - log_min)
+
+# Step 3: Scale to range [0.1, 1]
+scaled_values <- 0.1 + 0.9 * normalized
+
+filtered_enrichments1$alpha_score = scaled_values
+
+filtered_enrichments1 <- filtered_enrichments1 %>% group_by(Term)
+
+pdf('/Users/zackbrodtman/Downloads/cancer_DEGS_gsea.pdf')
+# Step 2: Plot the bar plot using ggplot2
+
+ggplot(filtered_enrichments1, aes(x = Combined.Score, y = reorder(Term, Combined.Score), fill = Color, alpha = -alpha_score)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Flips the axes to make it easier to read
+  scale_fill_identity() +  # Use the actual color values in the 'Color' column
+  theme_minimal() +
+  xlab("Combined Score") +
+  ylab("") + ggtitle("GSEA on Cancer Cell DEGs: Interferon Pathways")+
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)  # Rotate x-axis labels
+      # Remove legend
+  )  + NoLegend()+
+  geom_hline(yintercept = 0, linetype = "dashed") # Adjust alpha range for better visibility
+
+dev.off()
+
+filtered_enrichments[filtered_enrichments$Term == 'cellular response to type I interferon',]
+table(filtered_enrichments1$Term)
+```
+
+
+### IFN pathway analysis
+
+```{r}
+library(ComplexHeatmap)
+genes_of_interest <- c("IFNA1", "IFNA2", "IFNA4", "IFNA5", "IFNA6", "IFNA7", 
+                       "IFNA8", "IFNA10", "IFNA13", "IFNA14", "IFNA16", "IFNA17", 
+                       "IFNA21", "IFNW1", "IFNE", "IFNK", "IFNB1")
+genes_of_interest <- c(
+    "IFNA1", "IFNA2", "IFNA4", "IFNA5", "IFNA6", "IFNA7", "IFNA8", 
+    "IFNA10", "IFNA13", "IFNA14", "IFNA16", "IFNA17", "IFNA21", 
+    "IFNW1", "IFNE", "IFNK", "IFNB1", 
+    "ISG15", "MX1", "OAS1", "CD14", "CGAS", "CHUK", "DDX3X", "DHX33", "DHX36", "DHX58", "DHX9", "FLOT1", "G3BP1", "GAPDH", "GARIN5A", "HMGB2", "HSP90AA1", "HSPD1", "IFIH1", "IKBKE", "IRAK1", "IRF1", "IRF3", "IRF5", "IRF7", "ISG15", "KPNA2", "MAVS", "MMP12", "MYD88", "NMB", "NMBR", "OAS1", "OAS2", "OAS3", "PLCG2", "POLR3A", "POLR3B", "POLR3C", "POLR3D", "POLR3F", "POLR3G", "PQBP1", "PTPN11", "PTPN22", "RAB2B", "RIGI", "RIOK3", "RIPK2", "RNF135", "SETD2", "STAT1", "STING1", "SYK", "TANK", "TBK1", "TICAM1", "TICAM2", "TLR2", "TLR3", "TLR4", "TLR7", "TLR8", "TLR9", "TOMM70", "TRAF3", "TRAF3IP3", "TRAF6", "TRIM15", "TRIM56", "TRIM65", "UAP1", "USP22", "XIAP", "ZBTB20", "ZC3HAV1", "ZCCHC3", "FADD", "IKBKE", "IRF3", "IRF7", "LSM14A", "MAVS", "MMP12", "NLRC5", "RBM47", "RNF185", "STING1", "TBK1", "TRIM41", "TRIM56", "TRIM6", "UBE2K", "USP27X", "USP29", "WNT5A", "ZBP1", "CHUK", "DDX3X", "DHX36", "DHX9", "HAVCR2", "HSPD1", "IFIH1", "IL10", "IRF3", "IRF5", "IRF7", "LILRA4", "MAVS", "MMP12", "NLRC3", "NMB", "NMBR", "NMI", "PTPRS", "RIGI", "RIPK2", "SETD2", "STAT1", "TBK1", "TLR3", "TLR4", "TLR7", "TLR8", "TLR9", "TRIM65", "ACOD1", "ARRDC4", "ATG12", "ATG5", "BANF1", "CACTIN", "CD14", "CGAS", "CHUK", "CUL3", "CYLD", "DDX3X", "DDX56", "DHX33", "DHX36", "DHX58", "DHX9", "DTX4", "FLOT1", "G3BP1", "GAPDH", "GARIN5A", "GBP7", "GPATCH3", "HAVCR2", "HMGB2", "HSP90AA1", "HSPD1", "IFIH1", "IKBKE", "IL10", "ILRUN", "IRAK1", "IRF1", "IRF3", "IRF5", "IRF7", "IRF8", "IRGM", "ISG15", "ITCH", "KAT8", "KLHL22", "KPNA2", "LILRA4", "LILRB1", "MAVS", "MIR21", "MIR26B", "MMP12", "MORC3", "MYD88", "NLRC3", "NLRX1", "NMB", "NMBR", "NMI", "NPLOC4", "OAS1", "OAS2", "OAS3", "OTUD5", "PLCG2", "POLA1", "POLR3A", "POLR3B", "POLR3C", "POLR3D", "POLR3F", "POLR3G", "PPM1B", "PQBP1", "PTPN11", "PTPN22", "PTPRS", "PYCARD", "RAB2B", "RBX1", "REL", "RELB", "RIGI", "RIOK3", "RIPK2", "RNF125", "RNF135", "RNF216", "RNF26", "SETD2", "SIGLEC1", "SIRPA", "STAT1", "STING1", "SYK", "TANK", "TBK1", "TICAM1", "TICAM2", "TIRAP", "TLR2", "TLR3", "TLR4", "TLR7", "TLR8", "TLR9", "TOMM70", "TRAF3", "TRAF3IP1", "TRAF3IP3", "TRAF6", "TRAIP", "TREX1", "TRIM15", "TRIM21", "TRIM27", "TRIM38", "TRIM56", "TRIM65", "TYROBP", "UAP1", "UFD1", "USP22", "XAF1", "XIAP", "YY1", "ZBTB20", "ZC3HAV1", "ZCCHC3", "ADAR", "ARG1", "AZI2", "CACTIN", "CDC37", "CNOT7", "DCST1", "EIF4E2", "FADD", "GIGYF2", "HCK", "HDAC4", "HPX", "IFI27", "IFIH1", "IFITM1", "IFITM2", "IFITM3", "IFNA1", "IFNA10", "IFNA13", "IFNA14", "IFNA16", "IFNA17", "IFNA2", "IFNA21", "IFNA4", "IFNA5", "IFNA6", "IFNA7", "IFNA8", "IFNAR1", "IFNAR2", "IFNB1", "IFNE", "IFNG", "IFNGR1", "IFNGR2", "IFNK", "IFNL1", "IFNL2", "IFNL3", "IFNL4", "IFNLR1", "IFNW1", "IKBKE", "IL10RB", "IRAK1", "IRF1", "IRF3", "IRF7", "IRGM", "ISG15", "JAK1", "JAK2", "LSM14A", "MAVS", "MED1", "METTL3", "MIR21", "MMP12", "MUL1", "MYD88", "NLRC5", "NR1H2", "NR1H3", "OAS1", "OAS2", "OAS3", "OTOP1", "PARP14", "PARP9", "PPARG", "PTPN1", "PTPN11", "PTPN2", "PTPN6", "RAF1", "RBM47", "RNF185", "SAMHD1", "SIN3A", "SMIM30", "SP100", "STAT1", "STAT2", "STING1", "TANK", "TBK1", "TBKBP1", "TP53", "TRAF3", "TREX1", "TRIM41", "TRIM56", "TRIM6", "TRIM65", "TTLL12", "TXK", "TYK2", "UBE2K", "USP18", "USP27X", "USP29", "WNT5A", "YTHDF2", "YTHDF3", "ZBP1", "ADAR", "AZI2", "CACTIN", "CDC37", "CH25H", "CNOT7", "DCST1", "EIF4E2", "FADD", "GIGYF2", "HDAC4", "IFI27", "IFIH1", "IFIT1", "IFITM1", "IFITM2", "IFITM3", "IFNA1", "IFNA10", "IFNA13", "IFNA14", "IFNA16", "IFNA17", "IFNA2", "IFNA21", "IFNA4", "IFNA5", "IFNA6", "IFNA7", "IFNA8", "IFNAR1", "IFNAR2", "IFNB1", "IFNE", "IFNK", "IFNW1", "IKBKE", "IRAK1", "IRF3", "IRF7", "ISG15", "JAK1", "LSM14A", "MAVS", "METTL3", "MIR21", "MMP12", "MUL1", "MX1", "MYD88", "NLRC5", "OAS1", "OAS2", "OAS3", "PTPN1", "PTPN11", "PTPN2", "PTPN6", "RBM47", "RNF185", "SAMHD1", "SETD2", "SHFL", "SHMT2", "SIN3A", "SMIM30", "SMPD1", "SP100", "STAT1", "STAT2", "STING1", "TANK", "TBK1", "TBKBP1", "TRAF3", "TREX1", "TRIM41", "TRIM56", "TRIM6", "TRIM65", "TTLL12", "TYK2", "UBE2K", "USP18", "USP27X", "USP29", "WNT5A", "YTHDF2", "YTHDF3", "ZBP1", "ARRDC4", "CACTIN")#, 
+
+genes <- c("DDX3X", "DHX9", "FLOT1", "HMGB2", "HSP90AA1", "IFIH1", "IRF1", "IRF3", "IRF5", "IRF7", "ISG15", "LILRB1", "MAVS", "MIR26B", "MORC3", "NLRC3", "NLRX1", "NMI", "OAS1", "OAS2", "OAS3", "POLR3A", "POLR3B", "POLR3C", "POLR3D", "POLR3F", "POLR3G", "PPM1B", "PTPN11", "PTPRS", "PYCARD", "REL", "RELB", "RIGI", "RIOK3", "RIPK2", "RNF135", "RNF216", "SIRPA", "STING1", "TBK1", "TICAM1", "TIRAP", "TLR2", "TLR3", "TLR4", "TLR7", "TLR8", "TLR9", "TOMM70", "TRAF3", "TRAIP", "TRIM38", "TRIM56", "TRIM65", "YY1", "ZBTB20", rownames(m)[grep("IFN",rownames(m))])
+
+g <- union(genes, genes_of_interest)
+
+expr_matrix <- GetAssayData(m, slot = "counts")[intersect(g,rownames(m)), ]
+
+# Aggregate by condition (mean expression per condition)
+expr_matrix_avg <- AggregateExpression(m, features = intersect(g,rownames(m)), group.by = "condition", return.seurat = TRUE)$RNA$data
+
+expr_matrix_avg <- as.matrix(expr_matrix_avg)
+
+# Transpose the matrix so that genes are on the x-axis and conditions on the y-axis
+expr_matrix_transposed <- t(expr_matrix_avg)
+expr_matrix_transposed <- t(scale(t(expr_matrix_transposed[c("KL-CGASKO-MSA", "KL-MSA", "KL-CGASKO-DMSO", "KL-DMSO"),])))
+
+CGAS_KO_MSA <- expr_matrix_transposed["KL-CGASKO-MSA", ]
+
+# Calculate differences between cGAS KO + MSA2 and other conditions
+diff_matrix <- sweep(expr_matrix_transposed, 2, CGAS_KO_MSA, "-")
+
+gene_diff_sum <- apply(abs(diff_matrix), 2, sum)
+
+# Identify the top N genes with the highest differences (e.g., top 3)
+top_genes <- names(sort(gene_diff_sum, decreasing = TRUE))[1:30]
+
+# Highlight these genes in the original matrix
+expr_matrix_highlighted <- expr_matrix_transposed[, top_genes]
+
+
+order_index <- order(expr_matrix_highlighted["KL-CGASKO-MSA", ], decreasing = TRUE)
+
+# Reorder the matrix by the selected condition
+expr_matrix_ordered <- expr_matrix_highlighted[, order_index]
+
+
+
+pdf("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/IFN.pdf", width = 20)
+# Create a custom heatmap using ComplexHeatmap
+
+Heatmap(expr_matrix_z <- expr_matrix_ordered, 
+        name = "Expression", 
+        #col = colorRamp2(c(min(expr_matrix_transposed), median(expr_matrix_transposed), max(expr_matrix_transposed)), 
+         #                c("blue", "white", "red")),
+        cluster_rows = FALSE,  # Remove row dendrogram
+        cluster_columns = FALSE,  # Remove column dendrogram
+        row_names_side = "left",  # Move condition labels to the left
+        show_row_dend = FALSE,  # Explicitly hide row dendrogram (just in case)
+        show_column_dend = FALSE)  # Explicitly hide column dendrogram
+dev.off()
+
+FeaturePlot(m, features = g)
+
+
+a <- readRDS("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Entire Data/integrated_object.rds")
+
+for (s in names(table(a$sample))){
+  temp <- subset(a, subset = sample == s)
+  write.csv(temp@assays$RNA$counts, paste0("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Count Matrices/", s, ".csv"))
+}
+
+
+```
+
+
+## enrichment analysis of cancer cells
+
+```{r}
+dmso_msa <- read.csv("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/DEGs_DMSO_MSA.csv")
+
+
+library(enrichR)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(readxl)
+library(clusterProfiler)
+library(enrichplot)
+listEnrichrSites()
+setEnrichrSite("Enrichr") # Human genes
+websiteLive <- TRUE
+dbs <- listEnrichrDbs()
+if (is.null(dbs)) websiteLive <- FALSE
+if (websiteLive) head(dbs)
+
+dbs <- c("MSigDB_Hallmark_2020","GO_Biological_Process_2021")
+
+group2_genes <- list(
+  KL_DMSO = unique(dmso_msa[dmso_msa$avg_log2FC>0,]$gene),
+  KL_MSA = unique(dmso_msa[dmso_msa$avg_log2FC<0,]$gene))
+
+
+
+names <- list()
+names[1] <- 'KL-DMSO DEGs'
+names[2] <- 'KL-MSA DEGs'
+
+enrichments <- data.frame()
+for (i in 1:2){
+  top <- group2_genes[[i]]
+  if (websiteLive) {
+    enriched <- enrichr(top, dbs)
+  }
+  enrichment <- rbind(enriched[1]$MSigDB_Hallmark_2020, enriched[2]$GO_Biological_Process_2021)
+  enrichment <- enrichment[order(enrichment$Adjusted.P.value, decreasing = FALSE), ]
+  enrichment$Term <- gsub("\\s*\\(.*", "", enrichment$Term)
+  enrichment$Count <- str_count(enrichment$Genes, ";") + 1
+  
+  h_mut_enr<-head(enrichment, 20)
+  h_mut_enr$GeneRatio <- c(sapply(h_mut_enr$Overlap, function(x) eval(parse(text=x))))
+  
+  enrichment$GeneRatio <- c(sapply(enrichment$Overlap, function(x) eval(parse(text=x))))
+
+  if ((i == 1)){
+    enrichment$Condition <- 'KL-DMSO'
+  }
+  if ((i == 2)){
+    enrichment$Condition <- 'KL-MSA'
+  }
+  
+  if ((i == 1)){
+    h_mut_enr$Condition <- 'KL-DMSO'
+  }
+  if ((i == 2)){
+    h_mut_enr$Condition <- 'KL-MSA'
+  }
+  
+  enrichments <- rbind(enrichments, enrichment)
+}
+
+
+filtered_enrichments1 <- enrichments
+epsilon <- 1e-10
+log_transformed <- log(filtered_enrichments1$Adjusted.P.value + epsilon)
+
+# Step 2: Normalize the log-transformed values to range [0, 1]
+log_min <- min(log_transformed)
+log_max <- max(log_transformed)
+normalized <- (log_transformed - log_min) / (log_max - log_min)
+
+# Step 3: Scale to range [0.1, 1]
+scaled_values <- 0.1 + 0.9 * normalized
+
+filtered_enrichments1$alpha_score = scaled_values
+
+filtered_enrichments1 <- filtered_enrichments1 %>% group_by(Term)
+
+top <- filtered_enrichments1 %>%
+group_by(Condition) %>%
+  arrange(desc(Combined.Score)) %>%
+  slice_head(n = 15) %>%
+  ungroup()
+
+top <- top %>%
+  mutate(
+    Combined.Score = ifelse(Condition == "KL-MSA", -Combined.Score, Combined.Score),
+    Color = ifelse(Condition == "KL-DMSO", "#65011f", "#053061")
+  )
+
+filtered_enrichments1 <- filtered_enrichments1 %>%
+  mutate(
+    Combined.Score = ifelse(Condition == "KL-MSA", -Combined.Score, Combined.Score),
+    Color = ifelse(Condition == "KL-DMSO", "#65011f", "#053061")
+  )
+
+pdf('/Users/zackbrodtman/Downloads/cancer_DEGs_DMSO_MSA_gsea.pdf', height = 10)
+# Step 2: Plot the bar plot using ggplot2
+
+ggplot(top, aes(x = Combined.Score, y = reorder(Term, Combined.Score), fill = Color, alpha = -alpha_score)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Flips the axes to make it easier to read
+  scale_fill_identity() +  # Use the actual color values in the 'Color' column
+  theme_minimal() +
+  xlab("Combined Score") +
+  ylab("") + ggtitle("GSEA on Cancer Cell DEGs", subtitle = "KL-DMSO vs KL-MSA \n Positive Combined Score is enriched in KL-DMSO") +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)  # Rotate x-axis labels
+      # Remove legend
+  )  + NoLegend()+
+  geom_hline(yintercept = 0, linetype = "dashed") # Adjust alpha range for better visibility
+
+dev.off()
+
+write.csv(filtered_enrichments1, "/Users/zackbrodtman/Downloads/cancer_DEGs_DMSO_MSA_gsea.csv")
+
+
+###########################
+cgasko_dmso_cgasko_msa <- read.csv("/Users/zackbrodtman/Documents/jobwork/CUIMC/LKB1/repo/LKB1/Malignant/DEGs_CGASKO_DMSO_CGASKO_MSA.csv")
+
+
+group2_genes <- list(
+  KL_CGASKO_DMSO = unique(cgasko_dmso_cgasko_msa[cgasko_dmso_cgasko_msa$avg_log2FC>0,]$gene),
+  KL_CGASKO_MSA = unique(cgasko_dmso_cgasko_msa[cgasko_dmso_cgasko_msa$avg_log2FC<0,]$gene))
+
+
+
+names <- list()
+names[1] <- 'KL-CGASKO-DMSO DEGs'
+names[2] <- 'KL-CGASKO-MSA DEGs'
+
+enrichments <- data.frame()
+for (i in 1:2){
+  top <- group2_genes[[i]]
+  if (websiteLive) {
+    enriched <- enrichr(top, dbs)
+  }
+  enrichment <- rbind(enriched[1]$MSigDB_Hallmark_2020, enriched[2]$GO_Biological_Process_2021)
+  enrichment <- enrichment[order(enrichment$Adjusted.P.value, decreasing = FALSE), ]
+  enrichment$Term <- gsub("\\s*\\(.*", "", enrichment$Term)
+  enrichment$Count <- str_count(enrichment$Genes, ";") + 1
+  
+  h_mut_enr<-head(enrichment, 20)
+  h_mut_enr$GeneRatio <- c(sapply(h_mut_enr$Overlap, function(x) eval(parse(text=x))))
+  
+  enrichment$GeneRatio <- c(sapply(enrichment$Overlap, function(x) eval(parse(text=x))))
+
+  if ((i == 1)){
+    enrichment$Condition <- 'KL-CGASKO-DMSO'
+  }
+  if ((i == 2)){
+    enrichment$Condition <- 'KL-CGASKO-MSA'
+  }
+  
+  if ((i == 1)){
+    h_mut_enr$Condition <- 'KL-CGASKO-DMSO'
+  }
+  if ((i == 2)){
+    h_mut_enr$Condition <- 'KL-CGASKO-MSA'
+  }
+  
+  enrichments <- rbind(enrichments, enrichment)
+}
+
+
+filtered_enrichments1 <- enrichments
+epsilon <- 1e-10
+log_transformed <- log(filtered_enrichments1$Adjusted.P.value + epsilon)
+
+# Step 2: Normalize the log-transformed values to range [0, 1]
+log_min <- min(log_transformed)
+log_max <- max(log_transformed)
+normalized <- (log_transformed - log_min) / (log_max - log_min)
+
+# Step 3: Scale to range [0.1, 1]
+scaled_values <- 0.1 + 0.9 * normalized
+
+filtered_enrichments1$alpha_score = scaled_values
+
+filtered_enrichments1 <- filtered_enrichments1 %>% group_by(Term)
+
+top <- filtered_enrichments1 %>%
+group_by(Condition) %>%
+  arrange(desc(Combined.Score)) %>%
+  slice_head(n = 15) %>%
+  ungroup()
+
+top <- top %>%
+  mutate(
+    Combined.Score = ifelse(Condition == "KL-CGASKO-MSA", -Combined.Score, Combined.Score),
+    Color = ifelse(Condition == "KL-CGASKO-DMSO", "#65011f", "#053061")
+  )
+
+filtered_enrichments1 <- filtered_enrichments1 %>%
+  mutate(
+    Combined.Score = ifelse(Condition == "KL-CGASKO-MSA", -Combined.Score, Combined.Score),
+    Color = ifelse(Condition == "KL-CGASKO-DMSO", "#65011f", "#053061")
+  )
+
+pdf('/Users/zackbrodtman/Downloads/cancer_DEGs_CGASKO_DMSO_CGASKO_MSA_gsea.pdf', height = 10)
+# Step 2: Plot the bar plot using ggplot2
+
+ggplot(top, aes(x = Combined.Score, y = reorder(Term, Combined.Score), fill = Color, alpha = -alpha_score)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Flips the axes to make it easier to read
+  scale_fill_identity() +  # Use the actual color values in the 'Color' column
+  theme_minimal() +
+  xlab("Combined Score") +
+  ylab("") + ggtitle("GSEA on Cancer Cell DEGs", subtitle = "KL-CGASKO-DMSO vs KL-CGASKO-MSA \n Positive Combined Score is enriched in KL-CGASKO-DMSO") +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)  # Rotate x-axis labels
+      # Remove legend
+  )  + NoLegend()+
+  geom_hline(yintercept = 0, linetype = "dashed") # Adjust alpha range for better visibility
+
+dev.off()
+
+write.csv(filtered_enrichments1, "/Users/zackbrodtman/Downloads/cancer_DEGs_CGASKO_DMSO_CGASKO_MSA_gsea.csv")
+
+```
+
