@@ -1,0 +1,871 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+# `nmf` kernel
+library(tidyverse)
+library(patchwork)
+# library(viridis)
+library(NMF)
+library(Seurat)
+library(RColorBrewer)
+
+
+indir <- '/home/rstudio/LKB1'
+outdir <- '/home/rstudio/LKB1/nmf'
+
+if (!dir.exists(outdir)) {
+    dir.create(outdir, recursive=T)
+}
+
+message_ <- function(...) {
+    message(paste0(Sys.time(), ': ', paste(...)))
+}
+
+malig <- readRDS("LKB1/integration_with_celltypes.rds")
+malig <- subset(malig, subset = celltypes=='Malignant')
+
+sample_order <- malig@meta.data %>% 
+                group_by(orig.ident) %>% 
+                summarize(n=n()) %>% 
+                arrange(n) %>%
+                mutate(index = seq(nrow(.)))
+sample_order
+
+```
+
+
+```{r}
+
+
+produce_mat <- function(orig) {
+    sub <- subset(malig, subset = orig.ident == orig)
+    message_(toString(dim(sub@assays$RNA$counts)))
+
+
+    # Now extract the matrix
+    all_genes <- rownames(sub@assays$RNA$counts)
+    mito.genes <- grep(pattern = "^MT-", x = all_genes, value = TRUE)
+    rbl.genes <- grep(pattern = "^RB-", x = all_genes, value = TRUE)
+    rsl.genes <- grep(pattern = "^RS-", x = all_genes, value = TRUE)
+    rpl.genes <- grep(pattern = "^RPL-", x = all_genes, value = TRUE)
+    rbl.genes <- grep(pattern = "^RBL-", x = all_genes, value = TRUE)
+    rps.genes <- grep(pattern = "^RPS-", x = all_genes, value = TRUE)
+    rbs.genes <- grep(pattern = "^RBS-", x = all_genes, value = TRUE)
+    rbl1.genes <- grep(pattern = "^RB", x = all_genes, value = TRUE)
+    rsl1.genes <- grep(pattern = "^RS", x = all_genes, value = TRUE)
+    rpl1.genes <- grep(pattern = "^RPL", x = all_genes, value = TRUE)
+    rbl1.genes <- grep(pattern = "^RBL", x = all_genes, value = TRUE)
+    rps1.genes <- grep(pattern = "^RPS", x = all_genes, value = TRUE)
+    rbs1.genes <- grep(pattern = "^RBS", x = all_genes, value = TRUE)
+
+    remove_list <- c(mito.genes, rbl.genes, rsl.genes, rpl.genes, rbl.genes,
+                    rps.genes,rbs.genes,rbl1.genes,rsl1.genes,rpl1.genes,
+                    rbl1.genes,rps1.genes,rbs1.genes)
+
+    # Taking top 7k genes by mean expression
+    good_genes <- rowSums(sub@assays$RNA$counts) %>% 
+                sort(decreasing=T) %>% 
+                as.data.frame() %>%
+                rownames_to_column('gene') %>%
+                filter(!(gene %in% remove_list)) %>%
+                head(7000) %>%
+                .$gene
+    seu <- subset(sub, features = good_genes) 
+
+    seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 10000)
+    # seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = 2000)
+    # seu <- ScaleData(seu, features = rownames(seu))
+
+    mat <- as.matrix(seu@assays$RNA$data)
+    mat <- mat[rowSums(mat)>0,]
+
+    message_('Generated matrix for', orig)
+    message_(toString(dim(seu@assays$RNA$counts)))
+    return(mat)
+}
+
+
+#ct <- 0
+
+# First run just to initialize all possible matrices
+for (orig in sample_order$orig.ident) {
+    #ct <- ct + 1
+    #if (ct %% 4 != 1) next();  # TODO: EDIT BASED ON WHICH MACHINE IT'S RUNNING
+
+    # outfile <- file.path(outdir, paste0(orig, '.pdf'))
+    sample_outdir <- file.path(outdir, orig)
+    if (!dir.exists(sample_outdir)) {
+        dir.create(sample_outdir, recursive=T)
+    }
+    estim_outdir <- file.path(outdir, 'all_ranks')
+    if (!dir.exists(estim_outdir)) {
+        dir.create(estim_outdir, recursive=T)
+    }
+    
+
+    ranks <- c(2, 3, 4, 5, 6, 7, 8, 9, 10)
+    outfiles <- lapply(ranks, 
+                      function(x) file.path(sample_outdir, 
+                                            paste0(orig, '_r', x, '.RDS')))
+    names(outfiles) <- ranks
+    rank_estim_rds <- file.path(estim_outdir, paste0(orig, '_all.RDS'))
+    rank_estim_pdf <- file.path(estim_outdir, paste0(orig, '.pdf'))
+    
+
+    message_(orig)
+
+    # For the individual rank calculationss
+    donefile <- file.path(sample_outdir, 'done.checkpoint')
+    if (!file.exists(donefile)) {
+        mat <- produce_mat(orig)
+
+        # Individual NMF ranks
+        for (rank in ranks) {
+            t_0 <- Sys.time()
+            message_('Starting individual NMF for', orig, 'rank', rank)
+
+            if (!file.exists(outfiles[[as.character(rank)]])) {
+                # For 2700 cells, took between 1.5-2h at rank 7
+                # Optimistic estimate of 12ish hours for full estimate
+                # assuming the 10 runs are perfectly run in parallel
+                res <- nmf(mat, 
+                        rank,
+                        method='snmf/r', 
+                        nrun=10,
+                        seed=123456,
+                        rng=123456, 
+                        .opt='vP16')
+                saveRDS(res, outfiles[[as.character(rank)]])
+            }
+
+            t_1 <- Sys.time()
+            message_('Done with individual NMF for', orig, 'rank', rank,
+                     '. Elapsed time: ', t_1 - t_0)   
+        }
+
+    } else {
+        message_('Already done with individual NMFs for', orig)
+    }
+    file.create(donefile)
+
+
+    # For the rank estimation
+    
+    if (!file.exists(rank_estim_rds)) {
+        message_('Now running rank estimation for', orig)
+        
+        mat <- produce_mat(orig)
+
+        res <- nmf(mat, 
+                    ranks,
+                    method='snmf/r', 
+                    nrun=10,
+                    seed=123456,
+                    rng=123456, 
+                    .opt='vP16')
+        saveRDS(res, rank_estim_rds)
+        message_('Finished rank estimation for', orig)
+    } else {
+        message_('Already done with rank estimation for', orig)
+    }
+    
+    message_('Fully done with', orig)
+}
+```
+
+
+```{r}
+# Now to make the consensus maps, which are for some reason
+# more likely to crash during execution.
+# I'm running consensusmaps on each rank individually rather than
+# running it on the NMF Estimate object, which tends to crash
+
+ranks <- c(2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+
+for (sample in c( "LC27")) {
+  outfile <- file.path('/home/rstudio/LKB1/nmf', 
+                       'all_ranks', paste0(sample, '.pdf'))
+
+  sample_indir <- file.path('/home/rstudio/LKB1/nmf/', sample)
+
+  rds_files <- c(file.path(sample_indir, paste0(sample, '_r', ranks, '.RDS')))
+  objects <- lapply(rds_files, readRDS)
+
+  estim_res <- readRDS(file.path('/home/rstudio/LKB1/nmf/all_ranks', 
+                                  paste0(sample, '_all.RDS')))
+
+  # Running individual ranks
+  message_('Plotting consensus maps for ', sample)
+  pdf(outfile, height=15, width=20)
+  print(plot(estim_res))
+  for (myrank in ranks) {
+
+    # Modified from the consensusmap source code in `NMF` package
+    # For whatever reason, the base `consensusmap` function sometimes
+    # crashes silently and without throwing errors, causing the loop
+    # to terminate prematurely without error. This replicates most of the
+    # functionality we desire.
+    
+    sil <- function(o){
+      si <- silhouette(o, what='consensus', order = NA)
+      if( is.na(si) ) NA
+      else si[, 'sil_width']
+    }
+    ann_col <- list(basis = predict(objects[[myrank-1]]), 
+      consensus = predict(objects[[myrank-1]], what='consensus'), 
+      silhouette = sil(objects[[myrank-1]]))
+
+    aheatmap(consensus(objects[[myrank-1]]), 
+            distfun = function(x) as.dist(1-x), 
+            hclustfun = 'average', color='-RdYlBu', 
+            Rowv=T, Colv=T, main=paste0(sample, ' rank ', myrank), 
+            annCol=ann_col, 
+            labCol=NA, labRow=NA)
+  }
+  dev.off()
+}
+
+
+
+```
+
+
+
+
+
+```{r}
+
+
+
+
+# Create all the CSVs and plots
+library(tidyverse)
+library(NMF)
+
+
+for (sample in c('LC27')) {
+  sample_outdir <- file.path('/home/rstudio/LKB1/nmf', sample)
+
+
+  rds_files <- c(file.path(sample_outdir, paste0(sample, '_r', ranks, '.RDS')))
+  objects <- lapply(rds_files, readRDS)
+
+  # Running individual ranks
+  for (myrank in ranks) {
+    rank_outdir <- file.path(sample_outdir, paste0('rank_', myrank))
+    if (!dir.exists(rank_outdir)) {
+      dir.create(rank_outdir, recursive=T)
+    }
+    message_('Sample', sample, 'rank', myrank)
+
+    res <- objects[[myrank-1]]  
+
+    write.csv(res@fit@W, file.path(rank_outdir, paste0(sample, '_rank_', myrank, '_W.csv')))
+    write.csv(res@fit@H, file.path(rank_outdir, paste0(sample, '_rank_', myrank, '_H.csv')))
+
+    for (top_n in c(30, 50, 100, 200, 300)) {
+      tab <- matrix(NA, top_n, myrank)
+      colnames(tab)<-paste0(sample,'_factor',seq(1:myrank))
+      for(c in 1:myrank) {
+        genes <- order(as.data.frame(res@fit@W)[,c],decreasing = T) %>% head(n=top_n)
+        tab[,c] <- rownames(as.data.frame(res@fit@W))[genes]
+        colnames(tab)[c] <- paste0(sample,'_factor',c)
+      }
+      write.csv(tab, file.path(rank_outdir, paste0(sample, '_rank_', myrank, '_top_', top_n, '.csv')))
+
+      pdf(file.path(rank_outdir, paste0(sample, '_rank_', myrank, '_top_', top_n, '_basismap.pdf')))
+      basismap(res[rownames(res) %in% as.character(tab),])
+      dev.off()
+    }
+  }
+}
+
+
+```
+
+
+
+```{r}
+# `nmf kernel`; first load common functions
+library(circlize)
+library(ComplexHeatmap)
+library(cluster)
+
+optimal_ranks <- list(
+    'LC191' = 8, # 7, 8
+    'LC20' = 7, # 6, 7
+    'LC22' = 9, # 5, 9
+    'LC23' = 8, # 8, 6
+    'LC24' = 9, # 
+    'LC25' = 5, # 5 ,7
+    'LC26' = 6, # 4, 6, 9
+    'LC27' = 6, # 4, 5,
+    'LC28' = 6, # 6, 8
+    'LC29' = 7, # 6, 7, 9
+    'LC30' = 8, #
+    'LC31' = 9, # 6. 9  
+    'LC32' = 7, # 6, 7
+    'LC33' = 9 # 6, 9
+)
+
+source('./helpers/color.R')
+
+# Now load the optimal rank W files for each sample
+nmf_dir <- '/home/rstudio/LKB1/nmf'
+samples <- names(optimal_ranks)
+
+datafiles <- list()
+for (smpl in samples) {
+    r <- optimal_ranks[[smpl]]
+    indir <- file.path(nmf_dir, smpl, paste0('rank_', r))
+    infile <- file.path(indir, paste0(smpl, '_rank_', r, '_W', '.csv'))
+    data <- read.csv(infile, row.names=1)
+
+    column_names <-  paste0(smpl, '_r', r, '_f', 1:r)
+    colnames(data) <- column_names
+    datafiles[[smpl]] <- data %>% rownames_to_column('GENE')
+}
+
+# Remove noise factorizations
+datafiles[["LC191"]] <- datafiles[["LC191"]][,c(1,4,5,6,7,8,9)]
+datafiles[["LC20"]] <- datafiles[["LC20"]][,1:2]
+datafiles[["LC22"]] <- datafiles[["LC22"]][,c(1,2,6)]
+datafiles[["LC23"]] <- datafiles[["LC23"]][,c(1,2,8)]
+datafiles[["LC24"]] <- datafiles[["LC24"]][,c(1,2,5)]
+datafiles[["LC25"]] <- datafiles[["LC25"]][,c(1,4)]
+datafiles[["LC26"]] <- datafiles[["LC26"]][,c(1,6,7)]
+datafiles[["LC27"]] <- datafiles[["LC27"]][,c(1,2,3,4,6,7)]
+datafiles[["LC28"]] <- datafiles[["LC28"]][,c(1,6,7)]
+datafiles[["LC29"]] <- datafiles[["LC29"]][,c(1,5,7,8)]
+datafiles[["LC30"]] <- datafiles[["LC30"]][,c(1,3,4,6,7)]
+datafiles[["LC31"]] <- datafiles[["LC31"]][,c(1,5,6,9,10)]
+datafiles[["LC32"]] <- datafiles[["LC32"]][,c(1,5,7,8)]
+datafiles[["LC33"]] <- datafiles[["LC33"]][,c(1,7,8)]
+
+
+
+
+combined <- datafiles %>% reduce(full_join, by='GENE')
+combined[is.na(combined)] <- 0
+combined <- combined %>% column_to_rownames('GENE')
+
+n_genes <- 100  # 30, 50, 100, 125, 150
+top_genes <- matrixStats::rowVars(as.matrix(combined)) %>% 
+                sort(decreasing=T) %>% 
+                head(n_genes) %>% names()
+plot.data <- combined[top_genes,] %>% cor(method='spearman') 
+
+# Identify optimal k
+dist_mat <- dist(plot.data, method = "euclidean")
+ward_dist <- hclust(dist_mat, method = "ward.D2")
+
+max_k <- 15 
+sil_scores <- list()
+for (k in 2:max_k) {
+  # Cut the dendrogram to create k clusters
+  cluster_cut <- cutree(ward_dist, k)
+  
+  # Calculate silhouette score
+  score_vals <-  silhouette(cluster_cut, dist_mat)[, 'sil_width']
+  score_df <- data.frame(vals = score_vals)
+  score_df$k <- k
+  sil_scores[[k]] <- score_df
+}
+sil_scores <- bind_rows(sil_scores)
+
+# Pick k with highest silhouette scores, plus fewest negative scores
+options(repr.plot.width=7, repr.plot.height=4)
+p1 <- ggplot(sil_scores, aes(factor(k), vals, group=factor(k))) + 
+      geom_jitter() + geom_boxplot() + 
+      ggtitle('Silhouette scores for various k values') +
+      xlab('k') + ylab('Silhouette')
+print(p1)
+
+
+write.csv(combined, 'genes_by_factors.csv', row.names = TRUE)
+```
+
+
+
+```{r}
+# Plot heatmap
+#source('/home/rstudio/color.R')
+h <- 15
+w <- 15
+options(repr.plot.width=15, repr.plot.height=15)
+
+
+k <- 6
+p2 <- plot.data %>% 
+  Heatmap(#top_annotation = make_column_ha(plot.data, metadata),
+                          row_split=k, column_split=k, border=F,
+                          row_gap = unit(1, "mm"),
+                          column_gap = unit(1, "mm"),
+                          row_dend_reorder = T,
+                          column_dend_reorder = T
+                          )
+p2_d <- draw(p2)
+factornames <- rownames(plot.data)
+MPs <- lapply(row_order(p2_d), 
+              function(indices) factornames[indices])
+
+
+# Now rename MPs by relative size
+mp_to_factor <- list(
+   'MP1' = MPs[[1]],
+   'MP2' = MPs[[2]],
+   'MP3' = MPs[[3]],
+   'MP4' = MPs[[4]],
+   'MP5' = MPs[[5]],
+   'MP6' = MPs[[6]]
+)
+
+
+factor_to_mp <- list()
+for (factor in factornames) {
+  factor_to_mp[[factor]] <- NA
+  for (mp in names(mp_to_factor)) {
+    if (factor %in% mp_to_factor[[mp]]) {
+      factor_to_mp[[factor]] <- mp
+    }
+  }
+  if (is.na(factor_to_mp[[factor]])) {
+    factor_to_mp[[factor]] <- ''
+  }
+}
+factor_to_mp <- factor(unlist(factor_to_mp), 
+                      levels=c('MP1', 'MP2','MP3', 
+                              'MP4', 'MP5', 'MP6'))
+
+source('./LKB1/add_metadata.R')
+
+p3 <- Heatmap(plot.data, 
+              top_annotation = make_column_ha(plot.data, metadata),
+              row_split=factor_to_mp, column_split=factor_to_mp, 
+              border=F,
+              row_gap = unit(1, "mm"),
+              column_gap = unit(1, "mm"),
+              row_dend_reorder = T,
+              column_dend_reorder = T,
+              cluster_row_slices = FALSE, 
+              cluster_column_slices = FALSE,
+              heatmap_legend_param = list(title = "correlation")
+              )
+
+
+# 
+pdf('/home/rstudio/LKB1/nmf/metaprograms/co_correlation_heatmap.pdf', height = 15, width = 15)
+draw(p3, merge_legend=T)
+dev.off()
+
+capture.output(MPs, file = "/home/rstudio/LKB1/nmf/metaprograms/metaprograms.txt")
+
+
+MPs
+
+```
+
+
+```{r}
+get_metagenes_from_metaprogram <- function(metaprogram_cols, thresh) {
+  if (length(metaprogram_cols) == 1) {
+    df <- combined %>% select(all_of(metaprogram_cols))
+  } else {
+    df <- combined[, metaprogram_cols]
+  }
+  
+  out <- apply(df, 1, function(x){
+      y <- sum(x)/sqrt(length(x))
+      #y <- sum(w*x)/sqrt(sum(w^2))
+      return(y)
+    }) %>% sort(decreasing=T)
+
+  out <- data.frame(out) %>% rownames_to_column('gene')
+
+  return(out %>% filter(out > thresh))
+}
+
+# For instance, get the gene contributions to MP5
+# get_metagenes_from_metaprogram(MPs[[5]], 0.1) # %>% write.table('~/tmp/tmp.tsv', sep='\t', row.names=F, quote=F)
+
+
+################################################################################
+# Checkerboard plot
+top_n <- 20
+w <- 4
+h <- 12
+options(repr.plot.width=w, repr.plot.height=h)
+
+gene_contribs <- lapply(seq_along(names(mp_to_factor)), function(mp) {
+                          df <- get_metagenes_from_metaprogram(mp_to_factor[[mp]], 0)
+                          df$MP <- paste0('MP', mp)
+                          df
+                        }) %>% bind_rows()
+gene_contrib_mat <- gene_contribs %>% 
+                    pivot_wider(id_cols=gene, names_from=MP, values_from=out) %>%
+                    column_to_rownames('gene')
+top_genes <- gene_contribs %>% group_by(MP) %>%
+              slice_max(order_by=out, n=top_n) %>%
+              .$gene %>% unique()
+  
+top_genes <- top_genes[!(top_genes %in% c('MALAT1', 'GM42418', 'CMSS1'))]
+
+
+# !FIGURE (Table)
+gene_contribs %>% write.table('/home/rstudio/LKB1/nmf/metaprograms/MP_gene_contribs.tsv', sep='\t', row.names=F)
+
+
+p4 <- apply(gene_contrib_mat[top_genes, ], 2, function(x) (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))) %>%
+ #gene_contrib_mat[top_genes, ] %>% # symlog() %>%
+  Heatmap(cluster_columns=F, cluster_rows=F,
+          row_names_side='left', column_names_side='top',
+          col=colorRamp2(c(0.01, max(., na.rm=T)), 
+                         c('white', 'black')),
+          heatmap_legend_param = list(title = "weight"))
+# draw(p4)
+
+
+# !FIGURE 2b
+options(repr.plot.width=w, repr.plot.height=h)
+pdf('/home/rstudio/LKB1/nmf/metaprograms/checkerboard_plot.pdf', height=h, width=w)
+draw(p4, merge_legend=T)
+dev.off()
+
+
+options(repr.plot.width=25, repr.plot.height=20)
+patchwork::wrap_plots(lapply(list(p3, p4),
+                            function(p) {
+                              draw(p, merge_legend=T) %>% 
+                              grid.grabExpr()
+                            }), 
+                      ncol = 2, 
+                      widths=c(0.8, 0.2))
+
+
+
+```
+
+
+```{r}
+
+# Stack plots
+
+df <- data.frame(
+  mp = rep(paste0("MP", 1:6), lengths(MPs)),
+  sample = unlist(MPs)
+
+)
+
+df$sample <- sub("^(\\w+)_.*", "\\1", df$sample)
+df$sample <- sub("^(\\w+)_.*", "\\1", df$sample)
+
+group_info <- data.frame(
+  sample = c("LC191", "LC20", "LC22", "LC23", "LC24", "LC25", "LC26", "LC27", "LC28", "LC29", "LC30", "LC31", "LC32", "LC33"),
+  group = c("KL-MSA", "KL-MSA", "KL-DMSO", "KL-CGASKO-DMSO", "KL-DMSO", "KL-CGASKO-MSA", "KL-CGASKO-MSA", "KL-CGASKO-DMSO", "KL-CGASKO-DMSO", "KL-DMSO", "KL-CGASKO-MSA", "KL-MSA", "KL-MSA", "KL-MSA")
+)
+
+
+df <- merge(df, group_info, by = "sample")
+
+# Count occurrences of samples in each metaprogram
+counts <- df %>% 
+  group_by(mp, sample) %>% 
+  summarise(count = n()) %>% 
+  arrange(mp)
+
+pdf("stack_plots.pdf")
+# Create the stack plot
+ggplot(counts, aes(fill = sample, y = count, x = factor(mp))) +
+  geom_bar(stat = "identity") +
+  labs(x = "Metaprogram", y = "Count") +
+  ggtitle("Composition of Metaprograms by Samples") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+counts <- df %>% 
+  group_by(mp, group) %>% 
+  summarise(count = n()) %>% 
+  arrange(mp)
+
+# Create the stack plot
+ggplot(counts, aes(fill = group, y = count, x = factor(mp))) +
+  geom_bar(stat = "identity") +
+  labs(x = "Metaprogram", y = "Count") +
+  ggtitle("Composition of Metaprograms by Group") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+dev.off()
+
+```
+
+```{r}
+# pathway
+#install.packages("enrichR")
+library(enrichR)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(readxl)
+library(clusterProfiler)
+library(enrichplot)
+
+mpgenes <- list()
+GO_results <- list()
+pdf("Gene_Ontology_of_MPs.pdf")
+for (i in seq(1:6)){
+  mpgenes[[paste0("MP", i)]] <- read_excel("genes_by_mps.xlsx", sheet = paste0("MP", i), col_names = TRUE)
+  GO_results <- enrichGO(gene = str_to_title(head(mpgenes[[paste0("MP", i)]]$A, 20)), OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP")
+  #plot(barplot(GO_results, showCategory = 15)+ ggtitle(paste0("Gene Ontology of MP", i))) 
+  plot(dotplot(GO_results)+ ggtitle(paste0("Gene Ontology of MP", i)))
+}
+dev.off()
+
+
+#checkerboard plot using soms genes. merge MP gene expression into 1 df and remove duplicates
+names(mpgenes[["MP1"]])[names(mpgenes[["MP1"]]) == 'Avg'] <- 'MP1_Avg'
+names(mpgenes[["MP2"]])[names(mpgenes[["MP2"]]) == 'Avg.'] <- 'MP2_Avg'
+names(mpgenes[["MP3"]])[names(mpgenes[["MP3"]]) == 'Avg.'] <- 'MP3_Avg'
+names(mpgenes[["MP4"]])[names(mpgenes[["MP4"]]) == 'Avg.'] <- 'MP4_Avg'
+names(mpgenes[["MP5"]])[names(mpgenes[["MP5"]]) == 'Avg.'] <- 'MP5_Avg'
+names(mpgenes[["MP6"]])[names(mpgenes[["MP6"]]) == 'Avg.'] <- 'MP6_Avg'
+combined_df <- merge(mpgenes[["MP1"]][c('A', 'MP1_Avg')],mpgenes[["MP2"]][c('A', 'MP2_Avg')],by="A",all.x = TRUE, all.y=TRUE) 
+combined_df <- merge(combined_df ,mpgenes[["MP3"]][c('A', 'MP3_Avg')],by="A",all.x = TRUE, all.y=TRUE) 
+combined_df <- merge(combined_df ,mpgenes[["MP4"]][c('A', 'MP4_Avg')],by="A",all.x = TRUE, all.y=TRUE) 
+combined_df <- merge(combined_df ,mpgenes[["MP5"]][c('A', 'MP5_Avg')],by="A",all.x = TRUE, all.y=TRUE) 
+combined_df <- merge(combined_df ,mpgenes[["MP6"]][c('A', 'MP6_Avg')],by="A",all.x = TRUE, all.y=TRUE) 
+n_occur <- data.frame(table(combined_df$A))
+n_occur[n_occur$Freq > 1,]
+combined_df = combined_df[!combined_df$A %in% n_occur$Var1[n_occur$Freq > 1],]
+rownames(combined_df) = combined_df$A
+combined_df = subset(combined_df, select = -A )
+
+top_genes_2 <- c("STAT1", "GBP2", "IRF1", "IIGP1", "LARS2", "AHNAK", "XIST", "TOP2A", "MKI67", "CENPE", "AY036118", "FN1", "NEAT1", "VEGFA", "PKM", "ERO1L", "GPI1", "ZBTB20", "PDE4D", "ANO6", "RUNX1")
+
+p5 <- apply(combined_df[top_genes_2,], 2, function(x) (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))) %>%
+ #gene_contrib_mat[top_genes, ] %>% # symlog() %>%
+  Heatmap(cluster_columns=F, cluster_rows=F,
+          row_names_side='left', column_names_side='top',
+          col=colorRamp2(c(0.01, max(., na.rm=T)), 
+                         c('white', 'black')),
+          heatmap_legend_param = list(title = "weight"))
+
+
+options(repr.plot.width=w, repr.plot.height=h)
+pdf('/home/rstudio/LKB1/nmf/metaprograms/checkerboard_plot.pdf', height=h, width=w)
+draw(p5, merge_legend=T)
+dev.off()
+
+
+
+########################################################################################################
+
+mpgenes <- list()
+for (i in seq(1:6)){
+  mpgenes[[paste0("MP", i)]] <- read_excel("genes_by_mps.xlsx", sheet = paste0("MP", i), col_names = TRUE)
+  mpgenes[[paste0("MP", i)]]$A <- str_to_title(mpgenes[[paste0("MP", i)]]$A)
+}
+
+listEnrichrSites()
+setEnrichrSite("Enrichr") # Human genes
+websiteLive <- TRUE
+dbs <- listEnrichrDbs()
+if (is.null(dbs)) websiteLive <- FALSE
+if (websiteLive) head(dbs)
+
+dbs <- c("MSigDB_Hallmark_2020","GO_Biological_Process_2021")
+
+
+for (i in seq(1:6)){
+  if (websiteLive) {
+    enriched <- enrichr(head(mpgenes[[paste0("MP", i)]], 40)$A, dbs)
+  }
+  enrichment <- rbind(enriched[1]$MSigDB_Hallmark_2020, enriched[2]$GO_Biological_Process_2021)
+  enrichment <- enrichment[order(enrichment$Adjusted.P.value, decreasing = FALSE), ]
+  enrichment$Term <- gsub("\\s*\\(.*", "", enrichment$Term)
+  enrichment$Count <- str_count(enrichment$Genes, ";") + 1
+  
+  h_mut_enr<-head(enrichment, 50)
+  h_mut_enr$GeneRatio <- c(sapply(h_mut_enr$Overlap, function(x) eval(parse(text=x))))
+
+  cairo_pdf(paste0("Hallmark", i, ".pdf"), width = 18, height = 10)
+  print(ggplot(h_mut_enr, aes(x = GeneRatio, y = factor(Term, levels = rev(h_mut_enr$Term)))) + 
+  geom_point(aes(size = Count, color = Adjusted.P.value)) +
+  scale_size_continuous(range = c(1, 10)) + # Adjust the range of dot sizes as needed
+  #scale_color_manual(name = "Adjusted P Value", values = c("red", "blue"), labels = c("≤0.05", ">0.05")) +
+  theme_bw(base_size = 14) +scale_color_gradient(low = "red", high = "blue") + 
+  ylab(NULL) +
+  ggtitle(paste0("Hallmark Pathway Enrichment for MP",i)))
+  dev.off()
+  print(h_mut_enr)
+}
+
+h_mut_enr[(h_mut_enr['Term']=='Coagulation')|(h_mut_enr['Term']=='Hypoxia'),]
+
+
+#final plot
+for (i in seq(1:6)){
+  if (websiteLive) {
+    enriched <- enrichr(head(mpgenes[[paste0("MP", i)]], 40)$A, dbs)
+  }
+  enrichment <- rbind(enriched[1]$MSigDB_Hallmark_2020, enriched[2]$GO_Biological_Process_2021)
+  enrichment <- enrichment[order(enrichment$Adjusted.P.value, decreasing = FALSE), ]
+
+  enrichment$Count <- str_count(enrichment$Genes, ";") + 1
+  enrichment$Term <- gsub("\\s*\\(.*", "", enrichment$Term)
+
+  if (i == 1){
+    enrichment <- enrichment[(enrichment['Term']=="cellular response to interferon-gamma")|(enrichment['Term']=="cellular response to interferon-beta")|(enrichment['Term']=="type I interferon signaling pathway"),]
+    enrichment$metaprogram <- paste0("MP", i)
+    interesting_pathways <- enrichment
+  }
+  
+  if (i == 2){
+    enrichment <- enrichment[(enrichment['Term']=="regulation of RNA splicing")|(enrichment['Term']=="regulation of histone H3-K9 methylation"),]
+    enrichment$metaprogram <- paste0("MP", i)
+    interesting_pathways <- rbind(interesting_pathways, enrichment)
+  }
+  
+  if (i == 3){
+    enrichment <- enrichment[(enrichment['Term']=="G2-M Checkpoint")|(enrichment['Term']=="Mitotic Spindle"),]
+    enrichment$metaprogram <- paste0("MP", i)
+    interesting_pathways <- rbind(interesting_pathways, enrichment)
+  }
+  
+  if (i == 4){
+    enrichment <- enrichment[(enrichment['Term']=="cell-substrate junction assembly")|(enrichment['Term']=="cell-matrix adhesion"),]
+    enrichment$metaprogram <- paste0("MP", i)
+    interesting_pathways <- rbind(interesting_pathways, enrichment)
+  }
+  
+  if (i == 5){
+    enrichment <- enrichment[(enrichment['Term']=="Glycolysis")|(enrichment['Term']=="Hypoxia"),]
+    enrichment$metaprogram <- paste0("MP", i)
+    interesting_pathways <- rbind(interesting_pathways, enrichment)
+  }
+  
+  if (i == 6){
+    enrichment <- enrichment[(enrichment['Term']=="positive regulation of transcription of Notch receptor target")|(enrichment['Term']=="positive regulation of interleukin-2 production"),]
+    enrichment$metaprogram <- paste0("MP", i)
+    interesting_pathways <- rbind(interesting_pathways, enrichment)
+  }
+  
+  
+}
+    
+interesting_pathways <- interesting_pathways[c(1, 3, 2, 5, 4, 6, 7, 8, 9, 10, 11, 13, 12),]
+interesting_pathways$row <- row(interesting_pathways)[,1]
+cairo_pdf(paste0("pathways_of_interest.pdf"), width = 18, height = 10)
+
+print(
+  ggplot(interesting_pathways, aes(x = metaprogram, y = reorder(Term, rev(row)))) + 
+  geom_point(aes(size = Count, color = Adjusted.P.value)) +
+  scale_color_gradient(low = "red", high = "blue", limits = c(0,0.05)) + 
+  theme_bw(base_size = 14) +
+  ylab("Pathway") + 
+  scale_size_continuous(range = c(2, 10)) + 
+  xlab("Metaprogram") +
+  ggtitle("Pathways of Interest")
+)
+
+dev.off()
+
+
+
+mpgenes
+
+
+
+```
+
+
+### Volcano plot for lindsay
+
+```{r}
+m <- add_metadata(malig)
+levels(m)
+table(m$orig.ident)
+
+Idents(m) <- m$ID
+deg_results <- FindAllMarkers(m, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# Extract the top markers for each cell type
+top_markers <- deg_results %>% group_by(cluster) %>% top_n(n = 50, wt = avg_log2FC)
+
+kl_dmso <- subset(m, idents = c("KL-DMSO", "KL-CGASKO-DMSO"))
+kl_msa2 <- subset(m, idents = c("KL-MSA", "KL-CGASKO-MSA"))
+cgasko <- subset(m, idents = c("KL-CGASKO-DMSO", "KL-CGASKO-MSA"))
+deg_kl_dmso <- FindMarkers(kl_dmso, ident.1 = "KL-DMSO", ident.2 = "KL-CGASKO-DMSO", 
+                           only.pos = FALSE, min.pct = 0.25, logfc.threshold = 0.25)
+deg_kl_msa2 <- FindMarkers(kl_msa2, ident.1 = "KL-MSA", ident.2 = "KL-CGASKO-MSA", 
+                           only.pos = FALSE, min.pct = 0.25, logfc.threshold = 0.25)
+deg_cgasko <- FindMarkers(cgasko, ident.1 = "KL-CGASKO-DMSO", ident.2 = "KL-CGASKO-MSA", 
+                          only.pos = FALSE, min.pct = 0.25, logfc.threshold = 0.25)
+
+replace_zero_pvals <- function(deg_results) {
+  deg_results$p_val_adj[deg_results$p_val_adj == 0] <- 1e-300
+  return(deg_results)
+}
+
+# Replace 0 p-values for each DEG result
+deg_kl_dmso <- replace_zero_pvals(deg_kl_dmso)
+deg_kl_msa2 <- replace_zero_pvals(deg_kl_msa2)
+deg_cgasko <- replace_zero_pvals(deg_cgasko)
+
+
+get_top_genes_by_log2fc <- function(deg_results, n = 300) {
+  deg_results %>%
+    arrange(desc(abs(avg_log2FC))) %>%
+    slice_head(n = n)
+}
+
+deg_kl_dmso_50 <- get_top_genes_by_log2fc(deg_kl_dmso)
+deg_kl_msa2_50 <- get_top_genes_by_log2fc(deg_kl_msa2)
+deg_cgasko_50 <- get_top_genes_by_log2fc(deg_cgasko)
+
+library(EnhancedVolcano)
+pdf("volcano.pdf", height = 10, width = 12)
+EnhancedVolcano(deg_kl_dmso_50,
+    lab = rownames(deg_kl_dmso_50),
+    x = 'avg_log2FC', drawConnectors = TRUE, lengthConnectors = unit(0.001, 'npc'),
+    y = 'p_val_adj', selectLab = c('CD55', 'CTLA2A', 'SNED1', 'WNT5A', 'GBP4', 'IIGP1', 'ADD2','STAT1','ADH1A'),
+    title = 'KL-DMSO versus KL-CGASKO-DMSO', subtitle = "Positive L2FC indicates enrichment in KL-DMSO")
+
+
+EnhancedVolcano(deg_kl_msa2_50,
+    lab = rownames(deg_kl_msa2_50),
+    x = 'avg_log2FC',
+    y = 'p_val_adj', drawConnectors = TRUE, lengthConnectors = unit(0.001, 'npc'),
+    selectLab = c('ADD2', 'GBP2', 'RBFOX1', 'ANO6', 'ENPP2', 'IIGP1', 'DNM3', 'IKZF3', 'CD55', 'IL33'),
+    title = 'KL-MSA versus KL-CGASKO-MSA', subtitle = "Positive L2FC indicates enrichment in KL-MSA")
+
+EnhancedVolcano(deg_cgasko_50,
+    lab = rownames(deg_cgasko_50),
+    x = 'avg_log2FC',
+    y = 'p_val_adj', drawConnectors = TRUE, lengthConnectors = unit(0.001, 'npc'),
+    selectLab = c('RBFOX1','LRRC4C','CHL1','GBP4','GBP8'),
+    title = 'KL-CGASKO-DMSO versus KL-CGASKO-MSA', subtitle = "Positive L2FC indicates enrichment in KL-CGASKO-DMSO")
+dev.off()
+deg_kl_dmso_50$gene <- rownames(deg_kl_dmso_50)
+deg_kl_msa2_50$gene <- rownames(deg_kl_msa2_50)
+deg_cgasko_50$gene <- rownames(deg_cgasko_50)
+
+write_csv(deg_kl_dmso_50, "dmso_cgasko_dmso.csv")
+write_csv(deg_kl_msa2_50, "msa_cgasko_msa.csv")
+write_csv(deg_cgasko_50 , "cgasko_dmso_cgasko_msa.csv")
+
+
+rownames(deg_kl_msa2_50)[c(grep('IKZ', rownames(deg_kl_msa2_50)))]
+```
+
+
+
+
+
